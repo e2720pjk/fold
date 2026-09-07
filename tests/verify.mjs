@@ -7167,6 +7167,7 @@ function makeOpaqueToolFixture({
   resultSizes,
   contextWindow = 400_000,
   blacklisted = true,
+  thresholds,
 }) {
   const entries = [];
   const messages = [];
@@ -7228,8 +7229,101 @@ function makeOpaqueToolFixture({
     policy: {},
     contextWindow,
     ...(blacklisted ? { blacklistAutoFoldTools: new Set(["bash"]) } : {}),
+    ...(thresholds ? { thresholds } : {}),
   });
   return { sessionId, entries, messages, snapshot };
+}
+
+/**
+ * GATE 172: THE LADDER'S CHAPTER CAP FOLLOWS THE FLOOR (2026-09-07).
+ *
+ * `selectAutomaticChapter` accumulates whole units until a span reaches `minFoldChars`
+ * and refuses a multi-unit span past the cap. With the cap a constant at 16,000 and
+ * /fold-settings offering floors up to 32,000, any floor past the constant made the two
+ * conditions contradictory for every span wider than one unit: a unit under the floor
+ * could not qualify alone, and two units past the cap could not qualify together. Session
+ * 01a07498 (2026-09-07, floor 32,000) held fourteen sizable units in view, none over
+ * 32,000, and the frontier staged nothing while the bar announced a commit. The cap is
+ * now `chapterSpanCap(minFoldChars)`, twice the floor and never below the constant.
+ *
+ * The fixture is the contradiction itself: twelve units of ~12,000 chapter chars under a
+ * 32,000 floor. On the pre-fix runtime the selector returns null and the first assertion
+ * fails. On this one it composes a multi-unit chapter between the floor and the derived
+ * cap, the frontier stages it, and the commit lands. The shipped floor is pinned to read
+ * exactly as before: its cap IS the constant, and the same units compose under it.
+ */
+async function gateChapterCapFollowsTheFloor() {
+  assert.equal(context.chapterSpanCap(8_000), context.MAX_FOLD_SPAN_CHARS,
+    "the shipped floor's cap is not the constant");
+  assert.equal(context.chapterSpanCap(2_000), context.MAX_FOLD_SPAN_CHARS,
+    "the refusal floor's cap dropped below the constant");
+  assert.equal(context.chapterSpanCap(32_000), 64_000);
+
+  const thresholds = context.resolveThresholds({
+    maxTarget: 0.25, minTarget: 0.10, consolidateAfter: 8, minFoldChars: 32_000,
+  });
+  const unitChars = 12_000;
+  const wide = makeOpaqueToolFixture({
+    sessionId: "cap-follows-floor",
+    resultSizes: Array.from({ length: 12 }, () => unitChars),
+    thresholds,
+  });
+  assert.equal(wide.snapshot.thresholds.minFoldChars, 32_000, "the fixture floor did not travel");
+  const units = context.chapterUnits(wide.snapshot);
+  const state = context.emptyActiveContextState(wide.sessionId);
+  // The contradiction stated by number: every unit sits under the floor, and any two
+  // sit over the constant the cap used to be.
+  assert(unitChars < 32_000 && 2 * unitChars > context.MAX_FOLD_SPAN_CHARS,
+    "the fixture does not state the contradiction");
+  const candidate = context.selectAutomaticChapter(wide.snapshot, state);
+  assert(candidate, "A 32,000 floor left the chapter rung with nothing to select");
+  const encoded = Buffer.byteLength(
+    context.encodedFoldSource(wide.snapshot, state, candidate.parts, "chapter"), "utf8");
+  assert(encoded >= 32_000, `The chapter is ${encoded} chars, under the 32,000 floor`);
+  assert(encoded <= context.chapterSpanCap(32_000),
+    `The chapter is ${encoded} chars, past the derived cap`);
+  assert(encoded > context.MAX_FOLD_SPAN_CHARS,
+    "The chapter fits the old constant, so this gate would pass on the pre-fix runtime");
+  const indices = candidate.sourceRefs.map((ref) =>
+    wide.snapshot.mapped.findIndex((item) => item.ref?.entryId === ref.entryId));
+  const covering = units.filter((unit) =>
+    indices.some((index) => index >= unit.start && index < unit.end));
+  assert(covering.length > 1,
+    "The candidate is a single unit, which the pre-fix runtime accepted too");
+  // The frontier stages it as a ladder mark, and the commit lands and pays.
+  const marks = context.frontierMarks({ snapshot: wide.snapshot, state, ordinal: 1 });
+  assert(marks.length >= 1, "The frontier staged nothing at the 32,000 floor");
+  assert.equal(marks[0].kind, "chapter");
+  const committed = await commitCandidate(state, wide.snapshot, candidate);
+  assert.equal(committed.state.folds.length, 1);
+  assert.equal(committed.state.folds[0].kind, "chapter");
+  const before = bytesOf(context.projectActiveContext(wide.snapshot, state));
+  const after = bytesOf(context.projectActiveContext(wide.snapshot, committed.state));
+  assert(before - after >= 32_000 * 0.9,
+    `Folding the composed chapter freed only ${before - after} bytes`);
+
+  // THE SHIPPED FLOOR READS EXACTLY AS BEFORE: the same units, at 8,000, compose under
+  // the constant and never past it.
+  const shipped = makeOpaqueToolFixture({
+    sessionId: "cap-shipped-floor",
+    resultSizes: Array.from({ length: 12 }, () => unitChars),
+  });
+  assert.equal(shipped.snapshot.thresholds.minFoldChars, 8_000);
+  const shippedState = context.emptyActiveContextState(shipped.sessionId);
+  const shippedCandidate = context.selectAutomaticChapter(shipped.snapshot, shippedState);
+  assert(shippedCandidate, "The shipped floor selected nothing");
+  const shippedEncoded = Buffer.byteLength(
+    context.encodedFoldSource(shipped.snapshot, shippedState, shippedCandidate.parts, "chapter"), "utf8");
+  assert(shippedEncoded >= 8_000 && shippedEncoded <= context.MAX_FOLD_SPAN_CHARS,
+    `At the shipped floor the chapter is ${shippedEncoded} chars, outside 8,000..16,000`);
+  return {
+    capAtShippedFloor: context.chapterSpanCap(8_000),
+    capAt32000: context.chapterSpanCap(32_000),
+    chapterChars: encoded,
+    unitsComposed: covering.length,
+    freedBytes: before - after,
+    shippedChapterChars: shippedEncoded,
+  };
 }
 
 async function gateNoPermanentlyUnfoldableUnit() {
@@ -17380,7 +17474,12 @@ async function gateCommitSurfacesTellTheTruth() {
  */
 async function gateFoldCompositionCountsVisibleMass() {
   // Keep the unrelated raw tail below the chapter floor so the parent is the only mark.
-  const thresholds = { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 6, minFoldChars: 100_000 };
+  // The floor sits above the WHOLE fixture (16 turns of 6,000 chapter chars), not merely
+  // above one unit: a 100,000 floor kept the frontier quiet only while the chapter cap
+  // was a 16,000 constant that no multi-unit span at that floor could satisfy, which is
+  // the contradiction gate 172 removes, and under the derived cap the raw tail composed
+  // a second mark.
+  const thresholds = { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 6, minFoldChars: 1_000_000 };
   const built = makeFixture({ turns: 16, tools: false, chapterChars: 6_000,
     contextWindow: 1_000_000, thresholds: TINY_FOLD_FLOOR, sessionId: "diagram-parent" });
   const gapAt = built.entries.findIndex((entry) => entry.id === built.turnEntries[2][0]) + 1;
@@ -17994,6 +18093,7 @@ const gates = [
   [169, "Fold composition counts visible mass once", gateFoldCompositionCountsVisibleMass],
   [170, "The fold bar restores without a context event", gateFoldBarRestoresWithoutAContextEvent],
   [171, "The bar's colours are a choice, and every choice stays readable", gateFoldBarPaletteIsAReadableChoice],
+  [172, "The ladder's chapter cap follows the floor", gateChapterCapFollowsTheFloor],
   // 138 is retired with the steward band (Shane 2026-08-23). It pinned a PRE-COMMIT
   // invitation, timed one band before the epoch so the agent was asked while marking
   // could still matter. The ask moves to fold time, where the agent has just seen the

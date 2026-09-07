@@ -343,6 +343,26 @@ export const CONTEXT_STATUS_RESPONSE_BYTES = 24_000;
 export const MAX_UNMARKED_CANDIDATES = 3;
 
 export const MAX_FOLD_SPAN_CHARS = 16_000;
+
+/**
+ * THE LADDER'S CHAPTER CAP FOLLOWS THE FLOOR (2026-09-07).
+ *
+ * `selectAutomaticChapter` accumulates whole units until a span reaches `minFoldChars` and
+ * refuses a multi-unit span past this cap, so the cap has to sit at least one unit above
+ * the floor or the walk can never satisfy both. At the shipped 8,000 the 16,000 constant
+ * does. /fold-settings offers floors up to 32,000, and at any floor past the constant every
+ * multi-unit chapter was refused by arithmetic: only a single oversized unit or a tool batch
+ * could fold, and a prose session with the floor at 32,000 held its raw material forever
+ * while the status row announced a commit (session 01a07498, 2026-09-07: fourteen sizable
+ * units in view, none over 32,000, the frontier staging nothing). Twice the floor is the
+ * smallest cap under which a walk that crosses the floor by one unit shorter than the floor
+ * always lands inside it; the constant stays as the cap's own floor so every default reads
+ * exactly as before, and a manual span is never bounded by either (Shane, 2026-08-22).
+ */
+export function chapterSpanCap(minFoldChars: number): number {
+  return Math.max(MAX_FOLD_SPAN_CHARS, 2 * minFoldChars);
+}
+
 export const PEEK_DEFAULT_MAX_BYTES = 16_000;
 export const PEEK_HEAD_SHARE = 0.6;
 

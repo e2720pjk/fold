@@ -51,7 +51,7 @@ import {
   CONTEXT_STATUS_RESPONSE_BYTES,
   EXPAND_LEASE_GENERATIONS,
   MAX_EXPAND_LEASES,
-  MAX_FOLD_SPAN_CHARS,
+  chapterSpanCap,
   PEEK_DEFAULT_MAX_BYTES,
   PEEK_HEAD_SHARE,
   STATUS_DIET_INDEX_ROWS,
@@ -95,6 +95,10 @@ export function selectAutomaticChapter(
   // The maturity floor: a stale span may end only where the batch lane has already had
   // its chance, so a chapter can never claim a tool batch one turn before it qualifies.
   const matureEnd = staleSpanMatureEnd(snapshot.messages);
+  // THE CAP FOLLOWS THE FLOOR: a multi-unit span may not pass it, and it sits at least
+  // one floor above `minFoldChars` so the accumulate-until-over walk below can always
+  // land between the two (policy.ts, chapterSpanCap).
+  const spanCap = chapterSpanCap(snapshot.thresholds.minFoldChars);
   for (let unitIndex = 0; unitIndex < units.length; unitIndex += 1) {
     const first = units[unitIndex];
     if (first.end > matureEnd) break;
@@ -131,12 +135,12 @@ export function selectAutomaticChapter(
       if (claimed.size && refs.some((ref) => claimed.has(objectRefKey(ref)))) break;
       if (refsProtected(refs, state, snapshot)) break;
       const size = bytes(encodedFoldSource(snapshot, state, parts, "chapter"));
-      const biteSized = size <= MAX_FOLD_SPAN_CHARS || endIndex === unitIndex;
+      const biteSized = size <= spanCap || endIndex === unitIndex;
       // ACCUMULATE UNTIL OVER, never cut to hit the number. The walk grows the span one
       // whole unit at a time and records the first one that carries it past the floor,
       // so a fold is always at least minFoldChars and always ends on a message boundary.
       if (size >= snapshot.thresholds.minFoldChars && biteSized) best = { kind: "chapter", parts, sourceRefs: refs };
-      if (size > MAX_FOLD_SPAN_CHARS) break;
+      if (size > spanCap) break;
     }
     if (best) return best;
   }
