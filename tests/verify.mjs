@@ -18079,6 +18079,116 @@ async function gateUnreadableLineageWritesNothing() {
   };
 }
 
+/** The message a call threw, or null. The suite's `assert` counts a fixed list that has no
+ *  `doesNotThrow`, and that list is an instrument not to be widened for one gate's comfort. */
+function threwMessage(call) {
+  try {
+    call();
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/**
+ * GATE 175 (2026-09-20). A FOLD IS PROVEN ONCE PER REPLAY, AND A NEW ONE IS STILL PROVEN.
+ *
+ * `stateFromFoldRefs` runs per delta and ends in `parseActiveContextState`, so the forest was
+ * re-proven at every delta: 375 standing folds had their content addresses recomputed and
+ * their subtrees flattened and hashed 2,207 times over in one of Shane's sessions. Profiling
+ * a 1,147-delta load put 48.2% of all time inside `validateFoldForest` and 14.8% on
+ * `foldIdFor` alone. RECORD_PROVEN_FOLDS marks a fold from its SECOND appearance on, so the
+ * work is paid once per distinct fold per materialization.
+ *
+ * WHAT MUST NOT FOLLOW is a reader that stops checking. The mark is only ever applied to folds
+ * that came out of `records` past `parseFoldRecordEntry` and matched their ref on
+ * `recordSha256`, and never on first appearance, so a corrupt fold meets the full check the
+ * first time it is seen. This gate builds exactly that corruption and requires it to raise.
+ *
+ * The corruption is made self-consistent on purpose: `sourceSha256` is falsified AND the
+ * record digest and the checkpoint's ref are recomputed around it, so every cheaper check
+ * passes and the only thing standing between the ledger and a wrong forest is the source
+ * digest loop the mark is allowed to skip. Falsified by marking folds unconditionally, which
+ * lets this branch load.
+ */
+async function gateFoldProvenOncePerReplay() {
+  const isState = (entry) => entry.type === "custom" && entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY;
+  const isRecord = (entry) => entry.type === "custom" && entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY;
+
+  const built = makeFixture({ turns: 30, resultChars: 12_000, sessionId: "proven-once-per-replay" });
+  const runtime = makeRuntime(built, {
+    thresholds: { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 10, minFoldChars: 8_000 },
+  });
+  await startRuntime(runtime);
+  const committed = await runtimeCommit(runtime, { tokens: 830_000, contextWindow: 1_000_000 });
+  assert(committed.fired && committed.appliedMarks > 0, "the runtime folded nothing, so no fold can be corrupted");
+
+  // A fold standing across more than one revision is the case the mark is for.
+  const target = materialized(runtime).folds[0].id;
+  for (const action of ["pin", "unpin"]) {
+    await runtime.tools.get("pi_fold_context").execute(
+      `${action}-${target}`,
+      { action, ids: [target] },
+      new AbortController().signal,
+      undefined,
+      runtime.ctx,
+    );
+  }
+  const sessionId = built.sessionId;
+  const deltas = runtime.branch.filter((entry) => isState(entry) && entry.data.kind === "delta");
+  assert(deltas.length >= 2,
+    `the fixture holds ${deltas.length} deltas, too few for a fold to stand across revisions`);
+
+  // Anti-vacuity: the untouched branch loads, so a throw below is the corruption and not the fixture.
+  assert.equal(threwMessage(() => context.materializeActiveContextState(runtime.branch, sessionId)), null,
+    "the fixture does not load before anything is corrupted");
+
+  // THE CORRUPTION, MADE SELF-CONSISTENT so only the source digest loop can catch it.
+  const poisoned = structuredClone(runtime.branch);
+  const record = poisoned.find((entry) => isRecord(entry) && entry.data.foldId === target);
+  assert(record, `no durable record for the standing fold ${target}`);
+  const truth = record.data.fold.sourceSha256;
+  record.data.fold.sourceSha256 = `${truth.slice(0, -4)}dead`;
+  assert.notEqual(record.data.fold.sourceSha256, truth, "the fixture failed to alter the source digest");
+  record.data.recordSha256 = json.sha256Value(record.data.fold);
+  for (const entry of poisoned.filter(isState)) {
+    for (const ref of entry.data.foldRefs ?? []) {
+      if (ref.id === target) ref.sha256 = record.data.recordSha256;
+    }
+    for (const ref of entry.data.addFoldRefs ?? []) {
+      if (ref.id === target) ref.sha256 = record.data.recordSha256;
+    }
+  }
+
+  // The cheaper checks must be satisfied, or this gate proves only that they work.
+  assert.equal(threwMessage(() => context.parseFoldRecordEntry(record.data, sessionId)), null,
+    "the poisoned record fails its own identity check, so the source digest loop is never reached");
+
+  assert.throws(() => context.materializeActiveContextState(poisoned, sessionId),
+    /source digest drift/,
+    "a fold whose source digest does not match its refs loaded, so the mark blinded the check");
+
+  // Repaired, it loads again, so the throw was the corruption rather than the rewriting.
+  record.data.fold.sourceSha256 = truth;
+  record.data.recordSha256 = json.sha256Value(record.data.fold);
+  for (const entry of poisoned.filter(isState)) {
+    for (const ref of entry.data.foldRefs ?? []) {
+      if (ref.id === target) ref.sha256 = record.data.recordSha256;
+    }
+    for (const ref of entry.data.addFoldRefs ?? []) {
+      if (ref.id === target) ref.sha256 = record.data.recordSha256;
+    }
+  }
+  assert.equal(threwMessage(() => context.materializeActiveContextState(poisoned, sessionId)), null,
+    "the repaired branch did not load, so the gate rewrote more than it repaired");
+
+  return {
+    deltas: deltas.length,
+    corruptedFold: target,
+    corruptionStillRaises: true,
+  };
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -18207,6 +18317,7 @@ const gates = [
   // real boundaries on 2026-08-23 the band never opened once in a three-boundary
   // session, so the agent was never invited at all. The number stays spent.
   [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
+  [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],

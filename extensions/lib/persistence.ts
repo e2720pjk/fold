@@ -269,15 +269,54 @@ export function directFoldOwners(folds: readonly ActiveFold[]): Map<string, stri
   return owner;
 }
 
+/**
+ * A FOLD THIS MATERIALIZATION HAS ALREADY PROVEN, AND WILL NOT PROVE AGAIN (2026-09-20).
+ *
+ * The replay's cost was never the deltas, it was re-proving the whole forest at each one.
+ * `stateFromFoldRefs` runs per delta and ends in `parseActiveContextState`, so a session with
+ * 2,207 deltas and 400 standing folds recomputed 400 content addresses and flattened and
+ * hashed 400 fold subtrees 2,207 times over. Profiling a 1,147-delta load put 48.2% of all
+ * time inside `validateFoldForest` and 14.8% on `foldIdFor` alone.
+ *
+ * WHAT THE MARK ASSERTS, and why each half of it is already true:
+ *
+ *   The content address. `parseFoldRecordEntry` refuses a record unless
+ *   `fold.id === foldIdFor(fold.kind, fold.parts)`, and every fold reaching a marked forest
+ *   came out of `records` past that check, matched to its ref on `recordSha256`. The only
+ *   field `assignFoldParents` writes is `parentId`, which `foldIdFor` does not read. So the
+ *   recomputation could not reach a different verdict. This is the argument the 2026-08-28
+ *   `foldRecordRef` change already made in `persist`, applied on the reading side.
+ *
+ *   The source digest. This one is NOT implied by the record, so it is not skipped: it is
+ *   paid ONCE PER DISTINCT FOLD PER MATERIALIZATION instead of once per delta. A fold's
+ *   flattened refs are a pure function of its id, because the id pins kind and parts and each
+ *   child id pins its own subtree in turn, so a second computation over the same id is
+ *   arithmetic already done. `stateFromFoldRefs` marks only ids already proven against THIS
+ *   records map and leaves a newly arriving fold unmarked, so its digest is still checked, and
+ *   still inside `validateFoldForest` after the ownership loop that proves its children are
+ *   present. Error ordering is unchanged.
+ *
+ * KEYED ON OBJECT IDENTITY, like gate 160's VALIDATED_FORESTS, so nothing outside this module
+ * can present itself as proven. It carries none of gate 160's stated cost: a fold mutated in
+ * place is never marked, because the mark is applied to the objects `assignFoldParents` has
+ * just built and is read before `clone` hands the forest on.
+ */
+const RECORD_PROVEN_FOLDS = new WeakSet<ActiveFold>();
+const PROVEN_SOURCE_DIGESTS = new WeakMap<Map<string, FoldRecordEntry>, Set<string>>();
+
 export function validateFoldForest(folds: ActiveFold[]): ActiveFold[] {
   const rawValues = denseOwnArrayValues(folds);
   if (!rawValues || rawValues.some((fold) => !validFoldShape(fold))) {
     throw new Error("Invalid active-context fold forest shape");
   }
   const values = clone(rawValues) as ActiveFold[];
+  // READ OFF THE CALLER'S OBJECTS, BEFORE THE CLONE ABOVE COSTS US THE IDENTITY. `clone`
+  // preserves order, so the verdict for `values[i]` is the mark on `rawValues[i]`.
+  const proven = rawValues.map((fold) => RECORD_PROVEN_FOLDS.has(fold as ActiveFold));
   const byId = new Map<string, ActiveFold>();
-  for (const fold of values) {
-    if (fold.id !== foldIdFor(fold.kind, fold.parts) || byId.has(fold.id)) {
+  for (let index = 0; index < values.length; index += 1) {
+    const fold = values[index];
+    if ((!proven[index] && fold.id !== foldIdFor(fold.kind, fold.parts)) || byId.has(fold.id)) {
       throw new Error("Invalid active-context fold");
     }
     if (fold.kind === "tool-result" &&
@@ -304,7 +343,9 @@ export function validateFoldForest(folds: ActiveFold[]): ActiveFold[] {
   for (const fold of values) {
     if ((parent.get(fold.id) ?? null) !== fold.parentId) throw new Error(`Fold ${fold.id} parent drift`);
   }
-  for (const fold of values) {
+  for (let index = 0; index < values.length; index += 1) {
+    if (proven[index]) continue;
+    const fold = values[index];
     const refs = flattenFoldRefs(fold, { folds: values });
     if (fold.sourceSha256 !== sha256Value(refs)) throw new Error(`Fold ${fold.id} source digest drift`);
   }
@@ -890,13 +931,28 @@ export function stateFromFoldRefs(
     if (!record || record.recordSha256 !== ref.sha256) throw new Error(`Missing active-context fold record ${ref.id}`);
     return record.fold;
   });
+  const parented = assignFoldParents(folds);
+  // WHAT THIS MATERIALIZATION HAS ALREADY PROVEN IS MARKED; THE REST IS STILL PROVEN BELOW.
+  // See RECORD_PROVEN_FOLDS. A fold standing across deltas is marked from its second
+  // appearance on, so its content address and source digest are computed once for the whole
+  // replay rather than once per delta. A fold arriving now is deliberately left unmarked: its
+  // digest is checked by `validateFoldForest`, after the loop that proves its children are
+  // present, exactly where it was checked before.
+  let provenIds = PROVEN_SOURCE_DIGESTS.get(records);
+  if (!provenIds) {
+    provenIds = new Set<string>();
+    PROVEN_SOURCE_DIGESTS.set(records, provenIds);
+  }
+  for (const fold of parented) {
+    if (provenIds.has(fold.id)) RECORD_PROVEN_FOLDS.add(fold);
+  }
   const state: ActiveContextState = {
     version: 1,
     sessionId: wire.sessionId,
     revision: wire.revision,
     // `parseActiveContextState` at the end of this function validates the forest, so
     // validating it here as well was the same walk twice on one persist.
-    folds: assignFoldParents(folds),
+    folds: parented,
     expanded: clone(wire.expanded),
     protected: clone(wire.protected),
     tokensSinceToolFold: wire.tokensSinceToolFold ?? 0,
@@ -907,7 +963,10 @@ export function stateFromFoldRefs(
     ...(wire.advisory === undefined ? {} : { advisory: clone(wire.advisory) }),
     ...(wire.prepared === null || wire.prepared === undefined ? {} : { prepared: clone(wire.prepared) }),
   };
-  return parseActiveContextState(state, wire.sessionId, false);
+  const parsed = parseActiveContextState(state, wire.sessionId, false);
+  // RECORDED ONLY ONCE THE FOREST HAS PASSED, so a throw leaves nothing marked as proven.
+  for (const fold of parented) provenIds.add(fold.id);
+  return parsed;
 }
 
 export interface ProjectionFingerprint {
