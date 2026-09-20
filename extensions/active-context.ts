@@ -432,6 +432,10 @@ export function registerActiveContext(pi: any, options: {
     state: null as ActiveContextState | null,
     persisted: null as ActiveContextState | null,
     persistedWireVersion: 0 as 0 | 1 | 2,
+    /** Set when the branch HELD durable state this build could not read. Distinct from a
+     *  session that never had any, which is what `persistedWireVersion` 0 also means and
+     *  which legitimately writes the first checkpoint. See `persist`. */
+    lineageUnreadable: false,
     persistedStateSha256: "",
     persistedFoldRecords: new Map<string, FoldRecordEntry>(),
     persistenceQueue: Promise.resolve<void>(undefined),
@@ -1187,6 +1191,17 @@ export function registerActiveContext(pi: any, options: {
     }
     const durableRestored = restored ?? emptyActiveContextState(sessionId);
     persistence.state = durableRestored.prepared ? clearPrepared(durableRestored) : clone(durableRestored);
+    // AN UNREADABLE LINEAGE IS NOT AN EMPTY ONE (2026-09-07). `persistedWireVersion` reads
+    // 0 for both, and `persist` writes a CHECKPOINT whenever it is not 2, so a restore that
+    // threw put a second checkpoint into a branch that already had one. The reader refuses
+    // exactly that ("Duplicate active-context v2 checkpoint"), so the next load threw too,
+    // and wrote a third. ONE TRANSIENT FAILURE OF ANY CAUSE LATCHED THE SESSION DEAD AND
+    // EVERY RELOAD MADE IT STRICTLY WORSE: a real session reached five checkpoints, four of
+    // them from four /reload presses inside eleven minutes, and grew from 859 entries to
+    // 4,393 because each restart also re-cut the same spans and wrote fold records under
+    // the same ids with drifted bytes, 48 of 85 ids left conflicting. The two states are
+    // told apart here, once, rather than at each of `persist`'s callers.
+    persistence.lineageUnreadable = restoreError !== null;
     persistence.persistedWireVersion = restoredPersistence?.wireVersion ?? 0;
     persistence.persistedFoldRecords = restoredPersistence?.records ?? new Map<string, FoldRecordEntry>();
     persistence.persistedStateSha256 = restoredPersistence?.stateSha256 ?? semanticStateSha256(durableRestored);
@@ -1205,11 +1220,19 @@ export function registerActiveContext(pi: any, options: {
       try { foldBar.startupSnapshot = snapshotForEvent(ctx, restoredMessages); }
       catch { /* Keep the honest mapping fallback if the host cannot supply a view. */ }
     }
-    if (restoreError) safeNotify(
-      ctx,
-      `Active-context state was ignored; Pi native context remains authoritative: ${String(restoreError)}`,
-      "warning",
-    );
+    // The warning names the CONSEQUENCE and not only the cause: "state was ignored" read as
+    // graceful degradation, and the session it described could no longer fold at all. The
+    // suspension carries no ctx of its own so the canonical `context.suspend` record is
+    // emitted for a headless host without a second UI line saying the same thing twice.
+    if (restoreError) {
+      safeNotify(
+        ctx,
+        "Active-context state could not be read, so folding is suspended for this session and " +
+        `Pi native context remains authoritative: ${String(restoreError)}`,
+        "warning",
+      );
+      suspendAutomatic(restoreError, "restore", undefined);
+    }
     if (measurementRestoreError) safeNotify(
       ctx,
       `Malformed provider measurement receipt was ignored; automatic context remains unmeasured: ${String(measurementRestoreError)}`,
@@ -1220,6 +1243,18 @@ export function registerActiveContext(pi: any, options: {
   const persist = (ctx?: any): Promise<void> => {
     const operation = persistence.persistenceQueue.then(async () => {
       if (!persistence.state || !persistence.persisted) return;
+      // THE ONE WRITE THAT MUST NOT HAPPEN. Folding is suspended the moment a restore fails,
+      // so nothing automatic reaches this; a manual action still can, and one appended state
+      // entry is all it takes to latch the session. Raising rather than returning keeps the
+      // law of the discarded commit: a write that cannot land says so instead of vanishing,
+      // and the manual path already restores the state it entered with and reports.
+      if (persistence.lineageUnreadable) {
+        throw new Error(
+          "Active-context durable state is unreadable for this session, so no state may be " +
+          "written: a checkpoint here would be the second in this branch and would make every " +
+          "later load fail",
+        );
+      }
       let next = clone(persistence.state);
       const persistedFoldIds = new Set(persistence.persisted.folds.map((fold) => fold.id));
       const arrivingFoldIds = next.folds.filter((fold) => !persistedFoldIds.has(fold.id)).map((fold) => fold.id);

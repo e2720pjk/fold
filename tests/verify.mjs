@@ -1560,7 +1560,7 @@ async function gatePersistenceChain() {
   assert.equal(orphanState.folds.length, 0);
   const orphanRuntime = makeRuntime(built, { initialEntries: orphanBranch });
   await orphanRuntime.handlers.get("session_start")({}, orphanRuntime.ctx);
-  assert.equal(orphanRuntime.notifications.filter((notice) => /state was ignored/i.test(notice.message)).length, 0);
+  assert.equal(orphanRuntime.notifications.filter((notice) => /could not be read/i.test(notice.message)).length, 0);
 
   const brokenDigest = structuredClone(runtime.branch);
   const lastState = brokenDigest.filter((entry) =>
@@ -17974,6 +17974,111 @@ async function gateRecutSpanAdoptsItsDurableRecord() {
   return { firstApplied: committed.appliedMarks, recutApplied: recut.appliedMarks, adopted, records: records.length };
 }
 
+/**
+ * GATE 173 (2026-09-07). A FAILED RESTORE MUST NOT START A NEW LINEAGE.
+ *
+ * `persistedWireVersion` reads 0 both for a session that never had durable state and for
+ * one whose state this build could not read, and `persist` writes a CHECKPOINT whenever it
+ * is not 2. So a restore that threw appended a second checkpoint to a branch that already
+ * had one; the reader refuses exactly that ("Duplicate active-context v2 checkpoint"), so
+ * the next load threw as well, and wrote a third. One transient failure of any cause
+ * latched the session dead and EVERY RELOAD MADE IT STRICTLY WORSE. Shane's tabr-policy
+ * session reached five checkpoints, four of them from four /reload presses inside eleven
+ * minutes, and grew from 859 entries to 4,393: each restart also re-cut the same spans and
+ * wrote fold records under the same ids with drifted bytes, leaving 48 of 85 ids in
+ * conflict. The initiating failure was a torn session line from a full disk, but the latch
+ * is ours and any cause reaches it.
+ *
+ * The corruption here is the real one: a middle delta goes missing, so the chain breaks at
+ * a delta whose base is gone while the checkpoint survives. That is the shape that makes a
+ * second checkpoint fatal, which is why the fixture drops a delta rather than the
+ * checkpoint (dropping the checkpoint leaves a branch where writing one is legal).
+ *
+ * Anti-vacuity sits inside: a genuinely fresh session must still write its first
+ * checkpoint, or a runtime that had simply stopped writing state would pass.
+ * Falsified on the pre-fix runtime, which appends the second checkpoint.
+ */
+async function gateUnreadableLineageWritesNothing() {
+  const isState = (entry) => entry.type === "custom" && entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY;
+  const checkpoints = (entries) => entries.filter((entry) => isState(entry) && entry.data.kind === "checkpoint");
+  const band = { thresholds: { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 10, minFoldChars: 8_000 } };
+
+  // A FRESH SESSION STILL WRITES ITS ONE CHECKPOINT. Without this the fix could be "never
+  // write state" and every other assertion below would still hold.
+  const virgin = makeFixture({ turns: 30, resultChars: 12_000, sessionId: "unreadable-lineage" });
+  const first = makeRuntime(virgin, band);
+  await startRuntime(first);
+  const committed = await runtimeCommit(first, { tokens: 830_000, contextWindow: 1_000_000 });
+  assert(committed.fired && committed.appliedMarks > 0, "the first runtime folded nothing");
+  const written = first.appended.filter(isState);
+  assert.equal(checkpoints(written).length, 1, "a fresh session did not write exactly one checkpoint");
+
+  // Deltas come from state changes AFTER the checkpoint. Pin and unpin are the cheapest
+  // pair: two durable changes to one fold, with none of expand's parent-before-child order.
+  const pinned = materialized(first).folds[0].id;
+  for (const action of ["pin", "unpin"]) {
+    await first.tools.get("pi_fold_context").execute(
+      `${action}-${pinned}`,
+      { action, ids: [pinned] },
+      new AbortController().signal,
+      undefined,
+      first.ctx,
+    );
+  }
+
+  // The shape the defect needs: one checkpoint and at least two deltas, so a delta can go
+  // missing and still leave a successor whose base names it.
+  const states = first.branch.filter(isState);
+  const deltas = states.filter((entry) => entry.data.kind === "delta");
+  assert.equal(checkpoints(states).length, 1, `the fixture holds ${checkpoints(states).length} checkpoints, not 1`);
+  assert(deltas.length >= 2, `the fixture holds ${deltas.length} deltas, too few to break the chain in the middle`);
+
+  const dropped = deltas[0];
+  const torn = first.branch.filter((entry) => entry !== dropped);
+  assert.throws(
+    () => context.materializeActiveContextState(torn, virgin.sessionId),
+    /Broken active-context delta chain/,
+    "dropping a middle delta did not break the chain, so the fixture never reaches the defect",
+  );
+
+  // The load that used to poison the session.
+  const second = makeRuntime(virgin, { ...band, initialEntries: torn });
+  await startRuntime(second);
+  const retry = await runtimeCommit(second, { tokens: 830_000, contextWindow: 1_000_000 });
+
+  // THE DEFECT ITSELF, asserted before anything else so a falsifying run says so plainly.
+  const appendedState = second.appended.filter(isState);
+  assert.equal(appendedState.length, 0,
+    `an unreadable lineage wrote ${appendedState.length} state entries, the first a ${appendedState[0]?.data.kind}`);
+
+  const suspends = contextEvents(second).filter((event) => event.kind === "context.suspend");
+  assert.equal(suspends.length, 1, `an unreadable lineage announced ${suspends.length} suspensions, not 1`);
+  assert.equal(suspends[0].phase, "restore", `the suspension names phase "${suspends[0].phase}"`);
+  assert.match(suspends[0].error, /Broken active-context delta chain/, "the suspension does not carry the restore error");
+  assert(!retry.fired, "folding fired on a session whose lineage is unreadable");
+
+  // The claim that matters: the next load fails no WORSE than this one did. Pre-fix it
+  // failed on the duplicate checkpoint this load appended, and every load after that too.
+  const after = [...torn, ...second.appended];
+  assert.equal(checkpoints(after).length, 1, `the branch now holds ${checkpoints(after).length} checkpoints`);
+  const third = makeRuntime(virgin, { ...band, initialEntries: after });
+  await startRuntime(third);
+  const thirdSuspends = contextEvents(third).filter((event) => event.kind === "context.suspend");
+  assert.equal(thirdSuspends.length, 1, "the third load did not announce its refusal");
+  assert(!/Duplicate active-context v2 checkpoint/.test(thirdSuspends[0].error),
+    `the failure compounded: ${thirdSuspends[0].error}`);
+  assert.match(thirdSuspends[0].error, /Broken active-context delta chain/,
+    `the third load failed on something other than the original tear: ${thirdSuspends[0].error}`);
+  assert.equal(third.appended.filter(isState).length, 0, "the third load wrote state as well");
+
+  return {
+    freshCheckpoints: checkpoints(written).length,
+    deltas: deltas.length,
+    stateWritesAfterFailure: appendedState.length,
+    checkpointsAfter: checkpoints(after).length,
+  };
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -18101,6 +18206,7 @@ const gates = [
   // time. It also had a silent failure mode this gate could not see: measured against
   // real boundaries on 2026-08-23 the band never opened once in a three-boundary
   // session, so the agent was never invited at all. The number stays spent.
+  [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],
