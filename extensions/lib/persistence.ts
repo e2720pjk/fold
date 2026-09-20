@@ -68,6 +68,53 @@ export const STATE_DELTA_V2_KEYS = [
 export const MAX_ACTIVE_FOLD_RECORD_BYTES = 256 * 1024;
 export const MAX_ACTIVE_STATE_EVENT_BYTES = 512 * 1024;
 export const MAX_ACTIVE_FOLD_RECORDS = 4_096;
+
+/**
+ * HOW MANY DELTAS MAY STAND BETWEEN CHECKPOINTS (2026-09-20).
+ *
+ * The v2 ledger was one checkpoint and then deltas for the life of the session, and
+ * `materializeStatePersistence` replays every one of them on every load. Each delta rebuilds
+ * the WHOLE state, so a load costs the delta count times the state size: quadratic in
+ * session length. Shane's noloss session 01a0ad40 reached 2,207 deltas and took 129.6s to
+ * restore, against 0.6s for pi to parse the same 93MB of entries; 01a0ba4e took 56.1s on
+ * 1,147 deltas. Doubling the entries quadrupled the time (3,987 entries 9.3s, 7,974 entries
+ * 38.8s) and the per-delta cost rose with it (7.5ms to 57.0ms), because what each delta
+ * re-walks is the state, not the delta. The load is also not paid once: `session_start`,
+ * `session_tree`, `session_compact` and a branch switch each pay it again, and
+ * `doubleEscapeAction: "tree"` puts it behind a keypress.
+ *
+ * A CHECKPOINT STATES THE WHOLE STATE, so a replay may start at the LAST one rather than the
+ * only one and never walk the run before it. That bounds a load at this many deltas instead
+ * of at the session's lifetime. Nothing is weakened by starting later: a checkpoint carries
+ * its own digest and the deltas after it still chain, so the final state is proven by the
+ * same equalities as before. What a later start gives up is re-proving revisions that were
+ * already proven when they were written, and the fingerprint map loses the revisions before
+ * the checkpoint, which its one reader already treats as absent (see `projectionFingerprints`).
+ *
+ * THE BOUND IS A TRADE, AND 50 IS WHERE IT WAS MEASURED. A checkpoint names every standing
+ * fold by id and digest, so it costs far more bytes than a delta: 237.9KB against a 2.55KB
+ * delta at 375 folds, 248.9KB against 3.34KB at 213. The load after a checkpoint is 0.34s and
+ * 0.20s for those two sessions, and each replayed delta adds about 85ms at 375 folds, so the
+ * bound sets both the worst load and the write overhead:
+ *
+ *   K=100   8.8s worst load   +93% state-ledger bytes   (+5.6% of the session file)
+ *   K= 50   4.4s worst load  +187% state-ledger bytes   (+11% of the session file)
+ *   K= 25   2.2s worst load  +374% state-ledger bytes   (+22% of the session file)
+ *
+ * The state ledger is a small part of a session (5.9MB of 01a0ad40's 93MB), which is why the
+ * percentages look worse against the ledger than against the file. 50 takes the worst load
+ * under five seconds and the average near two, for a tenth of the file, and a session already
+ * past the bound heals itself on its next durable write.
+ *
+ * WHAT WOULD MAKE THE BOUND STOP MATTERING is the per-delta cost itself, which is still the
+ * whole state: 23.8% of a profiled load is `structuredClone` and 34% is `stableStringify`
+ * under `semanticStateSha256`, both walking every standing fold on every delta. Neither is
+ * reachable without giving the reader one canonical fold object per id for the life of a
+ * materialization, so that the clone stops being per-delta and a serializer memo can hit at
+ * all. That is a change to the aliasing barrier gate 158 guards and is deliberately NOT made
+ * here; until it is, this constant is what bounds the load.
+ */
+export const MAX_DELTAS_BETWEEN_CHECKPOINTS = 50;
 export const MAX_ACTIVE_FOLD_PARTS = 1_024;
 export const MAX_ACTIVE_EXPANDED = 1_024;
 export const MAX_ACTIVE_PROTECTED = 1_024;
@@ -992,6 +1039,12 @@ export interface MaterializedStatePersistence {
   records: Map<string, FoldRecordEntry>;
   stateSha256: string;
   projectionFingerprints: ProjectionFingerprints;
+  /**
+   * HOW MANY DELTAS STAND AFTER THE LAST CHECKPOINT in the branch just read. `persist` writes
+   * a checkpoint instead of a delta once this reaches `MAX_DELTAS_BETWEEN_CHECKPOINTS`, which
+   * is what stops the run, and therefore the load, from growing without bound.
+   */
+  deltasSinceCheckpoint: number;
 }
 
 export function materializeStatePersistence(
@@ -1044,6 +1097,7 @@ export function materializeStatePersistence(
   let stateStart = -1;
   let checkpointIndex = -1;
   let v2Seen = false;
+  let deltasSinceCheckpoint = 0;
   const rememberProjection = (): void => {
     fingerprintSources.set(state.revision, state);
   };
@@ -1060,11 +1114,25 @@ export function materializeStatePersistence(
     if (version !== 2) throw new Error("Invalid active-context persisted state version");
     const kind = ownValue(entry.data, "kind");
     if (kind === "checkpoint") {
-      if (v2Seen || checkpointIndex >= 0) throw new Error("Duplicate active-context v2 checkpoint");
+      // THE LAST CHECKPOINT WINS, AND A SECOND ONE IS NO LONGER FATAL (2026-09-20). This
+      // raised "Duplicate active-context v2 checkpoint" on sight of a second, which made the
+      // ledger append-only in the strongest sense: one checkpoint, then deltas forever, and a
+      // replay that walked all of them on every load. Restarting the replay at the newest
+      // checkpoint is what makes `MAX_DELTAS_BETWEEN_CHECKPOINTS` possible, and it reaches
+      // the same final state by the same digest equalities.
+      //
+      // It also un-latches the failure gate 173 describes. A branch that took a second
+      // checkpoint from a failed restore used to be unreadable forever, and every reload made
+      // it worse; such a branch now reads from its newest checkpoint. That is a second line of
+      // defence, not the first: the `lineageUnreadable` guard in `persist` still refuses to
+      // write the state entry that starts the damage, and gate 173 still pins it.
       checkpointIndex = index;
       stateStart = index;
+      deltasSinceCheckpoint = 0;
     } else if (checkpointIndex < 0) {
       throw new Error("Active-context v2 delta precedes migration checkpoint");
+    } else {
+      deltasSinceCheckpoint += 1;
     }
     v2Seen = true;
   }
@@ -1201,7 +1269,7 @@ export function materializeStatePersistence(
     writtenSha256 = wire.stateSha256 === calculated ? null : wire.stateSha256;
     rememberProjection();
   }
-  return { state, wireVersion, records, stateSha256, projectionFingerprints };
+  return { state, wireVersion, records, stateSha256, projectionFingerprints, deltasSinceCheckpoint };
 }
 
 export function materializeActiveContextState(

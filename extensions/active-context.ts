@@ -85,6 +85,7 @@ import {
   makeStateCheckpoint,
   makeStateDelta,
   MAX_ACTIVE_FOLD_RECORDS,
+  MAX_DELTAS_BETWEEN_CHECKPOINTS,
   materializeStatePersistence,
   foldProvenance,
   normalizeFoldsForPersistedRecords,
@@ -436,6 +437,10 @@ export function registerActiveContext(pi: any, options: {
      *  session that never had any, which is what `persistedWireVersion` 0 also means and
      *  which legitimately writes the first checkpoint. See `persist`. */
     lineageUnreadable: false,
+    /** Deltas standing after the newest checkpoint in the branch. See
+     *  `MAX_DELTAS_BETWEEN_CHECKPOINTS`: at the bound, `persist` writes a checkpoint instead
+     *  of a delta, which is what keeps a load's replay bounded. */
+    deltasSinceCheckpoint: 0,
     persistedStateSha256: "",
     persistedFoldRecords: new Map<string, FoldRecordEntry>(),
     persistenceQueue: Promise.resolve<void>(undefined),
@@ -1203,6 +1208,7 @@ export function registerActiveContext(pi: any, options: {
     // told apart here, once, rather than at each of `persist`'s callers.
     persistence.lineageUnreadable = restoreError !== null;
     persistence.persistedWireVersion = restoredPersistence?.wireVersion ?? 0;
+    persistence.deltasSinceCheckpoint = restoredPersistence?.deltasSinceCheckpoint ?? 0;
     persistence.persistedFoldRecords = restoredPersistence?.records ?? new Map<string, FoldRecordEntry>();
     persistence.persistedStateSha256 = restoredPersistence?.stateSha256 ?? semanticStateSha256(durableRestored);
     const restoredMessages = ctx.sessionManager.buildSessionContext?.()?.messages;
@@ -1322,7 +1328,15 @@ export function registerActiveContext(pi: any, options: {
           throw new Error("Active-context session changed after fold-record persistence");
         }
       }
-      const wire = persistence.persistedWireVersion === 2 ? makeStateDelta(persistence.persisted, next) : makeStateCheckpoint(next);
+      // A CHECKPOINT ENDS THE RUN THE READER WOULD OTHERWISE WALK (2026-09-20). A delta is
+      // the cheap write and stays the common one; at the bound the run is closed instead, so
+      // the next load replays at most `MAX_DELTAS_BETWEEN_CHECKPOINTS` deltas however long the
+      // session runs. A session that is already past the bound when this build first reads it
+      // closes its run on this write, so it pays the long load once and never again.
+      const runIsLong = persistence.deltasSinceCheckpoint >= MAX_DELTAS_BETWEEN_CHECKPOINTS;
+      const wire = persistence.persistedWireVersion === 2 && !runIsLong
+        ? makeStateDelta(persistence.persisted, next)
+        : makeStateCheckpoint(next);
       // THE WIRE CARRIES BOTH DIGESTS IT JUST DERIVED (2026-08-28). `makeStateDelta` writes
       // `baseStateSha256` from `persistence.persisted` and `stateSha256` from `next`, and
       // nothing mutates either state between that call and here, so re-hashing two whole
@@ -1336,6 +1350,7 @@ export function registerActiveContext(pi: any, options: {
       await pi.appendEntry(stateEntryType, wire);
       persistence.persisted = clone(next);
       persistence.persistedWireVersion = 2;
+      persistence.deltasSinceCheckpoint = wire.kind === "checkpoint" ? 0 : persistence.deltasSinceCheckpoint + 1;
       persistence.persistedStateSha256 = wire.stateSha256;
       persistence.state = lifecycle.shuttingDown ? null : clone(next);
       if (!sessionIdentityStillValid(ctx, sessionId, generationAtStart)) {

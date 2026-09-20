@@ -18079,6 +18079,28 @@ async function gateUnreadableLineageWritesNothing() {
   };
 }
 
+/**
+ * GATE 174 (2026-09-20). A BOUNDED DELTA RUN KEEPS THE REPLAY BOUNDED.
+ *
+ * The v2 ledger was one checkpoint and then deltas for the life of the session, and every
+ * load replayed all of them. Each delta rebuilds the whole state, so the cost was the delta
+ * count times the state size: Shane's noloss session 01a0ad40 reached 2,207 deltas and spent
+ * 129.6s in `materializeStatePersistence` against 0.6s for pi to parse the same 93MB, and
+ * 01a0ba4e spent 56.1s on 1,147. Doubling the entries quadrupled the time. The load is not
+ * paid once either: `session_start`, `session_tree`, `session_compact` and a branch switch
+ * each pay it, and `doubleEscapeAction: "tree"` puts it behind a keypress.
+ *
+ * `persist` now closes the run with a checkpoint at `MAX_DELTAS_BETWEEN_CHECKPOINTS`, and the
+ * reader restarts at the LAST checkpoint instead of refusing the second. On those two real
+ * sessions the load after a checkpoint is 0.34s and 0.20s, and the final digest is identical
+ * to the one the full 2,207-delta replay produced.
+ *
+ * The claim that makes the bound mean anything is the LAST one here: everything before the
+ * newest checkpoint may be dropped and the reader still reaches the same state, by digest.
+ * Anti-vacuity sits beside it, because "checkpoint on every write" would satisfy the bound
+ * and cost 238KB a write: a short run must still write deltas, and the checkpoints must be
+ * exactly a cadence apart.
+ */
 /** The message a call threw, or null. The suite's `assert` counts a fixed list that has no
  *  `doesNotThrow`, and that list is an instrument not to be widened for one gate's comfort. */
 function threwMessage(call) {
@@ -18088,6 +18110,89 @@ function threwMessage(call) {
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+async function gateBoundedDeltaRun() {
+  const isState = (entry) => entry.type === "custom" && entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY;
+  const kindsOf = (entries) => entries.filter(isState).map((entry) => entry.data.kind);
+  const cadence = context.MAX_DELTAS_BETWEEN_CHECKPOINTS;
+  assert(Number.isSafeInteger(cadence) && cadence >= 2, `the cadence is ${cadence}, which cannot be walked`);
+
+  const built = makeFixture({ turns: 30, resultChars: 12_000, sessionId: "bounded-delta-run" });
+  const runtime = makeRuntime(built, {
+    thresholds: { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 10, minFoldChars: 8_000 },
+  });
+  await startRuntime(runtime);
+  const committed = await runtimeCommit(runtime, { tokens: 830_000, contextWindow: 1_000_000 });
+  assert(committed.fired && committed.appliedMarks > 0, "the runtime folded nothing, so there is no state to checkpoint");
+
+  // Pin and unpin are the cheapest durable pair, as gate 173 found: two state changes to one
+  // fold with none of expand's ordering. Alternating them always differs from what is
+  // persisted, so every call appends.
+  const target = materialized(runtime).folds[0].id;
+  for (let index = 0; index < cadence + 4; index += 1) {
+    const action = index % 2 === 0 ? "pin" : "unpin";
+    await runtime.tools.get("pi_fold_context").execute(
+      `${action}-${index}`,
+      { action, ids: [target] },
+      new AbortController().signal,
+      undefined,
+      runtime.ctx,
+    );
+  }
+
+  const kinds = kindsOf(runtime.branch);
+  assert.equal(kinds[0], "checkpoint", `the ledger opens with a ${kinds[0]}, not a checkpoint`);
+  const checkpointAt = kinds.flatMap((kind, index) => (kind === "checkpoint" ? [index] : []));
+  assert.equal(checkpointAt.length, 2,
+    `the ledger holds ${checkpointAt.length} checkpoints across ${kinds.length} state writes, not 2`);
+
+  // THE CADENCE IS THE CADENCE. A checkpoint closes the run at the bound and not before it,
+  // which is also the anti-vacuity claim: a run shorter than the bound writes deltas only.
+  assert.equal(checkpointAt[1] - checkpointAt[0], cadence + 1,
+    `the checkpoints sit ${checkpointAt[1] - checkpointAt[0] - 1} deltas apart, not ${cadence}`);
+  assert(kinds.slice(1, cadence + 1).every((kind) => kind === "delta"),
+    "a short run wrote something other than deltas, so the bound is not what triggers a checkpoint");
+  assert(kinds.length > checkpointAt[1] + 1,
+    "the run ended on the checkpoint, so nothing proves writing resumes as deltas");
+  assert.equal(kinds[checkpointAt[1] + 1], "delta",
+    `the write after a checkpoint is a ${kinds[checkpointAt[1] + 1]}, so every write checkpoints`);
+
+  // The reader reports the standing run, which is what `persist` counts from on the next load.
+  const sessionId = built.sessionId;
+  const full = context.materializeStatePersistence(runtime.branch, sessionId);
+  const deltasAfterLast = kinds.length - checkpointAt[1] - 1;
+  assert.equal(full.deltasSinceCheckpoint, deltasAfterLast,
+    `the reader reports ${full.deltasSinceCheckpoint} standing deltas against ${deltasAfterLast} in the ledger`);
+
+  // THE CLAIM THE BOUND RESTS ON. Drop every state entry before the newest checkpoint and the
+  // reader still reaches the same state, by digest. This is the work a load no longer does.
+  const newest = runtime.branch.filter(isState)[checkpointAt[1]];
+  const from = runtime.branch.indexOf(newest);
+  const trimmed = runtime.branch.filter((entry, index) => index >= from || !isState(entry));
+  assert(trimmed.filter(isState).length < runtime.branch.filter(isState).length,
+    "trimming removed no state entries, so the claim is vacuous");
+  const short = context.materializeStatePersistence(trimmed, sessionId);
+  assert.equal(short.stateSha256, full.stateSha256,
+    "a replay from the newest checkpoint reached a different state than the whole run");
+  assert.equal(short.state.revision, full.state.revision, "the trimmed replay landed on a different revision");
+  assert.equal(short.state.folds.length, full.state.folds.length, "the trimmed replay stands a different forest");
+  assert.equal(short.deltasSinceCheckpoint, full.deltasSinceCheckpoint,
+    "the trimmed replay counts a different standing run");
+
+  // A second checkpoint is no longer fatal, which is what un-latches the gate 173 shape.
+  // Gate 173 still owns the refusal to WRITE one after a failed restore.
+  assert.equal(threwMessage(() => context.materializeActiveContextState(runtime.branch, sessionId)), null,
+    "a branch holding two checkpoints did not load");
+
+  return {
+    cadence,
+    stateWrites: kinds.length,
+    checkpoints: checkpointAt.length,
+    deltasBetween: checkpointAt[1] - checkpointAt[0] - 1,
+    standingRun: full.deltasSinceCheckpoint,
+    trimmedDigestMatches: short.stateSha256 === full.stateSha256,
+  };
 }
 
 /**
@@ -18317,6 +18422,7 @@ const gates = [
   // real boundaries on 2026-08-23 the band never opened once in a three-boundary
   // session, so the agent was never invited at all. The number stays spent.
   [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
+  [174, "A bounded delta run keeps the replay bounded", gateBoundedDeltaRun],
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
