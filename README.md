@@ -14,7 +14,7 @@
 pi install npm:pi-fold
 ```
 
-Node 22 or later, Pi 0.83 or later. MIT licensed.
+Node 22 or later and Pi 0.83 or later. Pi 1.0 is supported and requires Node 22.19 or later. MIT licensed. Pi supplies the extension's runtime packages; they are declared as host-provided peers, not private dependencies.
 
 Folding does not require a memory store, but every best result measured came from pairing it with one. The campaigns used [pi-canon](https://github.com/shaneconner/canon), installed separately. The two began as a single working setup and were split into separate extensions for modularity, and the experiments are what established that they work better as complements than either does alone. Only that pairing has been measured. Any durable long-term memory store is expected to compose the same way, though that is a suspicion rather than a result.
 

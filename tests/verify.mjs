@@ -26,6 +26,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -18294,6 +18295,123 @@ async function gateFoldProvenOncePerReplay() {
   };
 }
 
+// The host peer contract is exercised through a real SDK session, not the mock host.
+// Only the provider stream is synthetic: Pi owns dispatch, tools, projection and reload.
+async function gateHostPeersAndSdkSession() {
+  const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
+  const lock = JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
+  for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"]) {
+    assert.equal(manifest.peerDependencies[name], "*", `${name} must resolve from the host`);
+    assert.equal(manifest.dependencies?.[name], undefined, `${name} must not install a private copy`);
+    assert.equal(lock.packages[""].peerDependencies[name], "*");
+    assert.equal(lock.packages[`node_modules/${name}`].version.split(".")[0], "1",
+      "the development lock must exercise Pi 1.x, not silently test the old host");
+  }
+  const sdk = await import("@earendil-works/pi-coding-agent");
+  const hostRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const hostAi = hostRequire.resolve.paths("@earendil-works/pi-ai")
+    .map((root) => join(root, "@earendil-works", "pi-ai", "dist", "compat.js"))
+    .find((path) => existsSync(path));
+  assert(hostAi, "the stream fixture must use the SDK's own pi-ai copy");
+  const { createAssistantMessageEventStream } = await import(pathToFileURL(hostAi));
+  const directory = await mkdtemp(join(tmpdir(), "pi-fold-sdk-gate-"));
+  let session;
+  try {
+    const modelRuntime = await sdk.ModelRuntime.create({
+      authPath: join(directory, "auth.json"), modelsPath: null,
+      modelsStorePath: join(directory, "models-store.json"),
+      allowModelNetwork: false, refreshOnCreate: false,
+    });
+    const model = modelRuntime.getModel("openai", "gpt-4o");
+    assert(model, "the SDK fixture needs a real catalog descriptor");
+    await modelRuntime.setRuntimeApiKey(model.provider, "offline-fixture-not-a-provider-key");
+    const usage = {
+      input: 50_000, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 50_001,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const assistant = (content, stopReason = "stop") => ({
+      role: "assistant", content, stopReason, usage,
+      provider: model.provider, model: model.id, api: model.api, timestamp: Date.now(),
+    });
+    const manager = sdk.SessionManager.inMemory(directory);
+    const fixture = makeFixture({ turns: 12, resultChars: 12_000 });
+    for (const message of fixture.messages) {
+      manager.appendMessage(message.role === "assistant"
+        ? assistant(message.content, message.stopReason) : message);
+    }
+    const settings = sdk.SettingsManager.inMemory({
+      compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { mode: "off" },
+    });
+    const loader = new sdk.DefaultResourceLoader({
+      cwd: directory, agentDir: directory, settingsManager: settings,
+      noExtensions: true, noSkills: true, noPromptTemplates: true,
+      noThemes: true, noContextFiles: true,
+      additionalExtensionPaths: [join(projectRoot, "extensions", "index.js")],
+    });
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const frames = [];
+    const replies = [];
+    modelRuntime.streamSimple = (_model, wire) => {
+      frames.push(structuredClone(wire));
+      const message = replies.shift() ?? assistant([{ type: "text", text: "Offline fixture complete." }]);
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        stream.push({ type: "start", partial: message });
+        stream.push({ type: "done", reason: message.stopReason, message });
+        stream.end();
+      });
+      return stream;
+    };
+    ({ session } = await sdk.createAgentSession({
+      cwd: directory, agentDir: directory, modelRuntime, model, thinkingLevel: "off",
+      sessionManager: manager, settingsManager: settings, resourceLoader: loader,
+    }));
+    await session.bindExtensions({});
+    const errors = [];
+    session.extensionRunner.onError((error) => errors.push(error));
+    assert(session.getActiveToolNames().includes("pi_fold_context"));
+    await session.prompt("Establish the offline SDK context.");
+    await session.prompt("/fold");
+    const state = context.materializeActiveContextState(manager.getBranch(), manager.getSessionId());
+    assert(state && state.folds.length > 0, "the real SDK command folded nothing");
+    const target = state.folds.find((fold) => fold.parentId === null && fold.kind === "tool-result");
+    assert(target, "the fixture needs a visible tool fold with exact source");
+    const exact = context.peekFoldSource({
+      foldId: target.id, state, entries: manager.getBranch(), sessionId: manager.getSessionId(),
+      maximumBytes: context.ACTIVE_CONTEXT_POLICY.maxSourceChars,
+    });
+    assert(exact.source.includes("r".repeat(1_000)), "the stored fold lost the fixture's raw result");
+    replies.push(assistant([{
+      type: "toolCall", id: "sdk-exact-peek", name: "pi_fold_context",
+      arguments: { action: "peek", id: target.id, bytes: 200_000 },
+    }], "toolUse"));
+    await session.prompt("Recover the exact folded source.");
+    const peek = manager.getBranch().find((entry) => entry.type === "message" &&
+      entry.message.role === "toolResult" && entry.message.toolCallId === "sdk-exact-peek");
+    assert(peek && !peek.message.isError, "Pi failed to dispatch the fold tool");
+    assert.equal(peek.message.details.source, exact.source);
+    assert.equal(peek.message.details.truncated, false);
+    assert(frames.some((frame) => JSON.stringify(frame).includes("[pi-fold active-context fold ")),
+      "no folded projection reached the SDK provider boundary");
+    const beforeReload = context.materializeActiveContextState(manager.getBranch(), manager.getSessionId());
+    await session.reload();
+    await session.prompt("Check the restored SDK session.");
+    const restored = context.materializeActiveContextState(manager.getBranch(), manager.getSessionId());
+    for (const fold of beforeReload.folds) {
+      assert(restored.folds.some((candidate) => candidate.id === fold.id &&
+        candidate.sourceSha256 === fold.sourceSha256), "reload lost or changed a durable fold");
+    }
+    assert.deepEqual(errors, [], "a real SDK extension handler failed");
+    assert.equal(manager.getBranch().filter((entry) => entry.type === "custom" &&
+      entry.customType === "pi-fold-context-event" && entry.data.kind === "context.suspend").length, 0);
+    return { hostMajor: 1, frames: frames.length, folds: state.folds.length, exactPeek: true, reload: true };
+  } finally {
+    session?.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -18424,6 +18542,7 @@ const gates = [
   [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
   [174, "A bounded delta run keeps the replay bounded", gateBoundedDeltaRun],
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
+  [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],

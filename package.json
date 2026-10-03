@@ -37,7 +37,7 @@
     "test": "node tests/verify.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.83.0 <1",
+    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
