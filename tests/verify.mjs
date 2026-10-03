@@ -17193,7 +17193,7 @@ async function gateCommitSurfacesTellTheTruth() {
   assert(/\b42% · commit at 79%/.test(before), `a measured window below the band misread: ${before}`);
   // Over the band and not yet weighed, the row states where the window stands and does
   // not shout: the commit is the runtime's, not the reader's.
-  const overBand = context.renderFoldBar({ ...JSON.parse(JSON.stringify(widget.model)), share: 0.85, weighed: false, staleAfterCommit: false },
+  const overBand = context.renderFoldBar({ ...JSON.parse(JSON.stringify(widget.model)), share: 0.85, percent: 85, weighed: false, staleAfterCommit: false },
     200, { fg: (colour, text) => (colour === "warning" ? `<W>${text}</W>` : text), bold: (t) => t, getColorMode: () => "256color" });
   assert(/at commit point/.test(overBand) && !/COMMIT DUE|<W>at commit point/.test(overBand),
     `the over-band reading alarms or is missing: ${overBand}`);
@@ -18333,7 +18333,7 @@ async function gateFoldBarUsesPiContextUsage() {
   assert.notEqual(model.share, 120_000 / 255_616, "the provider/serving ratio still owns the display");
   assert.equal(model.commitShare, .80 * 255_616 / 272_000);
   assert.equal(model.aimShare, .20 * 255_616 / 272_000);
-  assert(widget.render(220).join("\n").includes("51% · commit at 75%"));
+  assert(widget.render(220).join("\n").includes("50% · commit at 75%"));
   assert.equal(context.foldBarTicks(model).get(8), "aim");
   assert.equal(context.foldBarTicks(model).get(29), "commit");
 
@@ -18345,6 +18345,23 @@ async function gateFoldBarUsesPiContextUsage() {
   // Consume the API percent as given, rather than building a competing percentage.
   runtime.usage = { tokens: 40_000, percent: 12.5, contextWindow: 400_000 };
   assert.equal(widget.model.share, .125);
+  // Floor only the label, matching the footer. Preserve the original API percent:
+  // 29 / 100 * 100 is 28.999..., and must not turn an exact 29% into 28%.
+  const displayPercents = [12.5, 27.8, 29, 57, 58, 29 - Number.EPSILON * 16, 100.9];
+  for (const percent of displayPercents) {
+    runtime.usage = { tokens: 40_000, percent, contextWindow: 400_000 };
+    const live = widget.model;
+    const label = Math.floor(percent);
+    assert.equal(live.percent, percent, "the original Pi percentage was lost");
+    assert.equal(live.share, percent / 100, "flooring the label changed the measured share");
+    assert(widget.render(220).join("\n").includes(`${label}% · `), `usage ${percent} did not match the footer`);
+    assert(context.foldBarPlainText({ ...live, staleAfterCommit: true }).includes(`${label}% before the commit`));
+    assert(context.foldBarPlainText({ ...live, stopped: "test suspension" }).includes(`${label}% full`));
+    assert.deepEqual(context.foldBarCells(live), context.foldBarCells({ ...live, percent: label }),
+      "the displayed percentage changed bar fill");
+  }
+  // Pure renderer callers without a host percent retain a share-only model.
+  assert(context.foldBarPlainText({ ...model, share: .278, percent: undefined }).includes("27% · "));
   // A valid zero is not an unknown reading. No saved value may fill an unknown gap.
   runtime.usage = { tokens: 0, percent: 0, contextWindow: 272_000 };
   assert.equal(widget.model.share, 0);
@@ -18395,7 +18412,14 @@ async function gateFoldBarUsesPiContextUsage() {
   fallback.usage = { tokens: 137_976, contextWindow: 272_000 };
   await project(fallback);
   await settle();
-  assert(fallback.statuses.at(-1).text.includes("51% full · commit at 75%"));
+  assert(fallback.statuses.at(-1).text.includes("50% full · commit at 75%"));
+  for (const percent of displayPercents) {
+    fallback.usage = { tokens: 120_000, percent, contextWindow: 272_000 };
+    await project(fallback);
+    await settle();
+    assert(fallback.statuses.at(-1).text.includes(`${Math.floor(percent)}% full`),
+      `fallback usage ${percent} did not match the footer`);
+  }
   fallback.usage = { tokens: 225_000, contextWindow: 272_000 };
   await project(fallback);
   await settle();

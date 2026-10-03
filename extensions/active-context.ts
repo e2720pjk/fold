@@ -757,7 +757,7 @@ export function registerActiveContext(pi: any, options: {
   // and post-compaction unknown state. Never substitute our saved provider measurement
   // or projection estimate. The band remains a share of the SERVING budget: convert its
   // points onto Pi's full-window axis, without changing any scheduling arithmetic.
-  const foldBarUsage = (ctx: any): Pick<FoldBarModel, "share" | "commitShare" | "aimShare"> => {
+  const foldBarUsage = (ctx: any): Pick<FoldBarModel, "share" | "percent" | "commitShare" | "aimShare"> => {
     let usage: unknown;
     try { usage = ctx.getContextUsage?.(); } catch { }
     const reportedWindow = ownValue(usage, "contextWindow");
@@ -778,7 +778,8 @@ export function registerActiveContext(pi: any, options: {
       usedTokens: null,
     });
     const budgetShare = capacity.budgetTokens / window;
-    return { share, commitShare: thresholds.maxTarget * budgetShare,
+    return { share, percent: share === null ? null : percent as number,
+      commitShare: thresholds.maxTarget * budgetShare,
       aimShare: thresholds.minTarget * budgetShare };
   };
   const installFoldBar = (ctx: any): void => {
@@ -802,7 +803,8 @@ export function registerActiveContext(pi: any, options: {
     }, { placement: "belowEditor" });
   };
   const foldBarModel = (ctx: any, input: {
-    share: number | null; commitShare: number; aimShare: number; staged: number; weighed: boolean;
+    share: number | null; percent?: number | null;
+    commitShare: number; aimShare: number; staged: number; weighed: boolean;
   }): FoldBarModel => {
     const state = persistence.state;
     // THE SAME SNAPSHOT /fold-status PRICES AGAINST. `markFreedBytes` answers ZERO, silently,
@@ -816,6 +818,7 @@ export function registerActiveContext(pi: any, options: {
     const model: FoldBarModel = {
       brand: brandNoun,
       share: input.share,
+      percent: input.percent,
       commitShare: input.commitShare,
       aimShare: input.aimShare,
       mapped: false, mass: emptyFoldBarMass(),
@@ -914,7 +917,7 @@ export function registerActiveContext(pi: any, options: {
       if (ladder.automaticFailure) parts.push("FOLDING STOPPED");
       // Unmeasured is stated, never guessed: an estimate rendered as a fact is the habit
       // that cost a live session, and this line is the most-read surface there is.
-      parts.push(share === null ? "not measured" : `${Math.round(share * 100)}% full`);
+      parts.push(share === null ? "not measured" : `${Math.floor(usage.percent ?? share * 100)}% full`);
       // THE LIVE BAND, NOT THE LAST SNAPSHOT'S (2026-08-29). This read the threshold off
       // `lifecycle.latestSnapshot`, which is derived per context event, so a band changed
       // in /fold-settings went on being announced at its old value until the next event

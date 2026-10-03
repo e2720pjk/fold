@@ -254,6 +254,8 @@ export function foldBarShades(palette: FoldBarPalette, dark: boolean): Record<Fo
 export interface FoldBarModel {
   brand: string;
   share: number | null;
+  /** Pi's original percent avoids round-trip drift when flooring the usage label. */
+  percent?: number | null;
   commitShare: number;
   aimShare: number;
   /** Estimated visible mass, counted exactly once, in the category order above. */
@@ -355,7 +357,7 @@ export function renderFoldBar(model: FoldBarModel, width: number, theme: FoldBar
   const muted = (text: string): string => theme.fg("muted", text);
   const brand = theme.fg("dim", model.brand);
   if (model.stopped) return cut(`${brand} ${theme.fg("error", theme.bold("FOLDING STOPPED"))}` +
-    (model.share === null ? "" : neutral(` · ${Math.round(model.share * 100)}% full`)));
+    (model.share === null ? "" : neutral(` · ${Math.floor(model.percent ?? model.share * 100)}% full`)));
   if (model.share === null) return cut(`${brand} ${muted(`not measured yet · folds automatically at ${Math.round(model.commitShare * 100)}%`)}`);
   const truecolorMode = theme.getColorMode?.() === "truecolor";
   const dark = !lightBackground(theme);
@@ -429,7 +431,7 @@ export function renderFoldBar(model: FoldBarModel, width: number, theme: FoldBar
       bar += bg ? `${bg}${ink(left as FoldBarKind, "▌")}\x1b[49m` : solid(left);
     }
   }
-  const pct = Math.round(model.share * 100);
+  const pct = Math.floor(model.percent ?? model.share * 100);
   const parts: string[] = [];
   if (model.staleAfterCommit) parts.push(muted(`${pct}% before the commit`));
   else {
