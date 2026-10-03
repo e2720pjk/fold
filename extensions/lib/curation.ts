@@ -261,12 +261,13 @@ export function foldStatusText(input: {
 
   if (input.usedTokens === null || !(input.budgetTokens > 0)) {
     // "provider" is infrastructure vocabulary and "sets it" names no observable event.
-    lines.push("  Window   not measured yet; the first model response will measure it.");
+    lines.push("  Budget   not measured yet; the first model response will measure it.");
   } else {
     const share = input.usedTokens / input.budgetTokens;
     const filled = Math.max(0, Math.min(STATUS_BAR_WIDTH, Math.round(share * STATUS_BAR_WIDTH)));
     const bar = `${"▇".repeat(filled)}${"░".repeat(STATUS_BAR_WIDTH - filled)}`;
-    lines.push(`  Window   ${bar}  ${Math.round(share * 100)}%  ` +
+    // This detailed view reports serving headroom, not Pi's full-window percentage.
+    lines.push(`  Budget   ${bar}  ${Math.round(share * 100)}%  ` +
       `${n(input.usedTokens)} / ${n(input.budgetTokens)} tokens`);
     const commitAt = input.commitAtShare * input.budgetTokens;
     // The headroom is what a person actually wants: not the trigger's share, but how much

@@ -10929,9 +10929,17 @@ process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   // reaches both, every turn.
   const piSession = readFileSync(
     join(PI_INSTALL_ROOT, "dist", "core", "agent-session.js"), "utf8");
-  const postRun = /_handlePostAgentRun\(\)\s*\{[\s\S]*?await this\._checkCompaction\(msg\)/.test(piSession);
-  assert(postRun,
+  // Pi 1.0 renamed msg to message and passes the completed run's tool results.
+  // Both forms must still await the same proactive check at the post-run boundary.
+  const postRunCall = /await this\._checkCompaction\((?:msg|message)(?:, true, toolResults)?\)/g;
+  const postRunChecksCompaction = (text) =>
+    /_handlePostAgentRun\(\)\s*\{[\s\S]*?await this\._checkCompaction\((?:msg|message)(?:, true, toolResults)?\)/.test(text);
+  assert(postRunChecksCompaction(piSession),
     "Pi no longer checks compaction after an agent run settles, so the turn boundary buys nothing");
+  assert(!postRunChecksCompaction(piSession.replace(postRunCall, "false")),
+    "the post-run source check still passes with its compaction call removed");
+  assert(/await this\.agent\.prompt\(messages\);[\s\S]*?await this\._handlePostAgentRun\(\)/.test(piSession),
+    "Pi no longer reaches the post-run compaction boundary after awaiting its agent");
   const beforeSend = /await this\._checkCompaction\(lastAssistant, false\)/.test(piSession);
   assert(beforeSend,
     "Pi no longer checks compaction before sending a user message, so pushed stages never trigger it");

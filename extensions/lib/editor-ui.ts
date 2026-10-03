@@ -1125,7 +1125,7 @@ export class FoldEditorView {
 		// one surface the rule was never checked against. Nothing here is estimated.
 		if (occupancy.usedTokens === null || !(occupancy.budgetTokens > 0)) {
 			lines.push(truncateToWidth(
-				"window not measured yet; the first model response will measure it", width));
+				"budget not measured yet; the first model response will measure it", width));
 			for (const line of this.stagedLines()) lines.push(truncateToWidth(line, width));
 			return lines;
 		}
@@ -1153,7 +1153,7 @@ export class FoldEditorView {
 			: ` · commit at ${(occupancy.commitOccupancy * 100).toFixed(0)}%${headroom}` +
 				`${occupancy.commitDue ? " · COMMIT DUE" : ""}`;
 		lines.push(truncateToWidth(
-			`${occupancyBar(occupancy.usedTokens, occupancy.budgetTokens)} ` +
+			`Budget ${occupancyBar(occupancy.usedTokens, occupancy.budgetTokens)} ` +
 			`${percent}%${timing}` +
 			` · ${usedTokensText}/${occupancy.budgetTokens.toLocaleString("en-US")}`,
 			width,
