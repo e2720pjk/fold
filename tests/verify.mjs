@@ -328,7 +328,7 @@ function makeRuntime(built, {
   const statuses = [];
   const branch = structuredClone(initialEntries ?? built.entries);
   const messages = structuredClone(built.messages);
-  let usage = { tokens: 0, contextWindow: built.contextWindow ?? 272_000 };
+  let usage = { tokens: null, percent: null, contextWindow: built.contextWindow ?? 272_000 };
   let sequence = 0;
   let aborts = 0;
   const appendBranch = (entry) => {
@@ -384,7 +384,10 @@ function makeRuntime(built, {
   runtime.ctx = {
     model: { provider: "openai-codex", id: "gpt-test" },
     thinkingLevel: "max",
-    getContextUsage: () => structuredClone(usage),
+    getContextUsage: () => ({ ...structuredClone(usage),
+      percent: Object.hasOwn(usage, "percent") ? usage.percent
+        : usage.tokens === null ? null : 100 * usage.tokens / usage.contextWindow,
+    }),
     abort() { aborts += 1; },
     ui: {
       notify(message, level) { notifications.push({ message, level }); },
@@ -12851,7 +12854,7 @@ async function gateSavedSettingsReachTheSession() {
     await project(runtime);
     await settle();
     const beforeLine = runtime.statuses.at(-1).text;
-    assert(beforeLine.includes("commit at 80%"),
+    assert(beforeLine.includes("commit at 72%"),
       `The session did not start on the registered band: ${beforeLine}`);
     const firedCommits = (from) => contextEvents(runtime, from)
       .filter((event) => event.kind === "context.commit" && event.deferred === false);
@@ -12883,7 +12886,7 @@ async function gateSavedSettingsReachTheSession() {
     assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).thresholds.maxTarget, 0.7,
       "stepping the trigger row did not reach disk");
     const steppedLine = runtime.statuses.at(-1).text;
-    assert(steppedLine.includes("commit at 70%"),
+    assert(steppedLine.includes("commit at 63%"),
       `The status line kept announcing the band pi booted with: ${steppedLine}`);
 
     // Four more, to 0.50, which the standing measurement is already past: the same line
@@ -12962,7 +12965,7 @@ async function gateSavedSettingsReachTheSession() {
     // either "COMMIT DUE" or, once a commit has been weighed against this same provider
     // count, "commit held"; both say the band is BELOW us, which is only true if the
     // refusal left it at 50. A push that had landed would name a higher point instead.
-    assert(/COMMIT DUE|commit held|commit at 50%/.test(runtime.statuses.at(-1).text),
+    assert(/COMMIT DUE|commit held|commit at 45%/.test(runtime.statuses.at(-1).text),
       `A refused push moved the live band: ${runtime.statuses.at(-1).text}`);
     assert.equal(contextEvents(runtime, afterRefusal)
       .filter((event) => event.kind === "context.settings").length, 0,
@@ -17187,7 +17190,7 @@ async function gateCommitSurfacesTellTheTruth() {
   await project(runtime);
   await settle();
   const before = row();
-  assert(/\b4\d% · commit at 80%/.test(before), `a measured window below the band misread: ${before}`);
+  assert(/\b42% · commit at 79%/.test(before), `a measured window below the band misread: ${before}`);
   // Over the band and not yet weighed, the row states where the window stands and does
   // not shout: the commit is the runtime's, not the reader's.
   const overBand = context.renderFoldBar({ ...JSON.parse(JSON.stringify(widget.model)), share: 0.85, weighed: false, staleAfterCommit: false },
@@ -17237,7 +17240,7 @@ async function gateCommitSurfacesTellTheTruth() {
   await settle();
   const fresh = row();
   assert(!/before the commit/.test(fresh), `a new count did not clear the stale marker: ${fresh}`);
-  assert(/\b10% · commit at 80%/.test(fresh), `the fresh count did not render as a live reading: ${fresh}`);
+  assert(/\b10% · commit at 79%/.test(fresh), `the fresh count did not render as a live reading: ${fresh}`);
   assert(!/\bPin\b/.test(fresh) && widget.model.pinnedRefs === 0, `nothing is pinned yet the row names a pin count: ${fresh}`);
 
   // WHAT IS HELD IS NAMED AND DRAWN (Shane 2026-09-04): pin the newest turn's entries
@@ -17790,7 +17793,11 @@ async function gateFoldBarPaletteIsAReadableChoice() {
     // Read the repaint off the raw fill, which every measured bar carries; the pinned
     // shade reached the row only through a "0 Pin" label the inventory no longer names.
     const shade = context.foldBarShades({ map: "cividis", start: 0.2, end: 0.9 }, true).raw;
-    assert(widget.render(400).join("\n").includes(escape(shade)), "the bar did not repaint in the chosen map");
+    const repainted = widget.render(400).join("\n");
+    // Pi's smaller full-window fill can give Raw only a right half-cell. That shade
+    // lives in the background escape, not the foreground; both are real bar ink.
+    assert(repainted.includes(escape(shade)) || repainted.includes(escape(shade).replace("[38;", "[48;")),
+      "the bar did not repaint in the chosen map");
     // The map row clamps at the list's end rather than wrapping or refusing loudly.
     screen.handleInput("\x1b[C");
     assert.equal(widget.model.palette.map, "cividis");
@@ -18297,6 +18304,129 @@ async function gateFoldProvenOncePerReplay() {
 
 // The host peer contract is exercised through a real SDK session, not the mock host.
 // Only the provider stream is synthetic: Pi owns dispatch, tools, projection and reload.
+/** GATE 177: Pi's live usage owns the display, not our last measured serving ratio.
+ * Repaints are reads only; band points change coordinates, never scheduling semantics.
+ */
+async function gateFoldBarUsesPiContextUsage() {
+  const fixture = () => makeFixture({ turns: 8, resultChars: 3_000,
+    contextWindow: 272_000, sessionId: "native-usage-bar" });
+  const runtime = makeRuntime(fixture());
+  runtime.ctx.model.contextWindow = 272_000;
+  runtime.ctx.model.maxTokens = 128_000; // An output ceiling is not an allocated reserve.
+  let widget;
+  let reads = 0;
+  const getUsage = runtime.ctx.getContextUsage;
+  runtime.ctx.getContextUsage = () => { reads += 1; return getUsage(); };
+  runtime.ctx.ui.theme = { fg: (_c, text) => text, bold: (text) => text };
+  runtime.ctx.ui.setWidget = (_key, factory) => { widget = factory({ requestRender() {} }); };
+  await startRuntime(runtime);
+  await measure(runtime, 120_000, 272_000);
+  await project(runtime);
+  await settle();
+  // Pi includes trailing messages. Deliberately differ from the saved provider count.
+  runtime.usage = { tokens: 137_976, contextWindow: 272_000 };
+  const before = { appended: runtime.appended.length, messages: runtime.messages.length,
+    steered: runtime.steered.length, state: materialized(runtime) };
+  const initialReads = reads;
+  const model = widget.model;
+  assert.equal(model.share, getUsage().percent / 100, "the bar does not use Pi's reported percent");
+  assert.notEqual(model.share, 120_000 / 255_616, "the provider/serving ratio still owns the display");
+  assert.equal(model.commitShare, .80 * 255_616 / 272_000);
+  assert.equal(model.aimShare, .20 * 255_616 / 272_000);
+  assert(widget.render(220).join("\n").includes("51% · commit at 75%"));
+  assert.equal(context.foldBarTicks(model).get(8), "aim");
+  assert.equal(context.foldBarTicks(model).get(29), "commit");
+
+  // Fresh Pi values must reach the SAME component without a lifecycle/status update.
+  runtime.usage = { tokens: 40_000, contextWindow: 400_000 };
+  assert(widget.render(220).join("\n").includes("10% · commit at 77%"));
+  assert.equal(widget.model.commitShare, .80 * (400_000 - 16_384) / 400_000);
+  assert.deepEqual(widget.model.mass, model.mass, "a live reading remapped composition");
+  // Consume the API percent as given, rather than building a competing percentage.
+  runtime.usage = { tokens: 40_000, percent: 12.5, contextWindow: 400_000 };
+  assert.equal(widget.model.share, .125);
+  // A valid zero is not an unknown reading. No saved value may fill an unknown gap.
+  runtime.usage = { tokens: 0, percent: 0, contextWindow: 272_000 };
+  assert.equal(widget.model.share, 0);
+  for (const usage of [
+    { tokens: null, percent: null, contextWindow: 272_000 },
+    { tokens: null, percent: 50, contextWindow: 272_000 },
+    { tokens: 137_976, percent: null, contextWindow: 272_000 },
+    { tokens: 137_976, percent: NaN, contextWindow: 272_000 },
+    { tokens: 137_976, percent: Infinity, contextWindow: 272_000 },
+    { tokens: -1, percent: -1, contextWindow: 272_000 },
+    { tokens: 137_976, percent: 50, contextWindow: 0 },
+  ]) {
+    runtime.usage = usage;
+    const row = widget.render(220).join("\n");
+    assert(row.includes("not measured yet") && !/[█▌░]/.test(row), row);
+    assert.equal(widget.model.share, null, "an unknown host reading used a cached/local count");
+  }
+  runtime.ctx.getContextUsage = () => undefined;
+  assert(widget.render(220).join("\n").includes("not measured yet"));
+  runtime.ctx.getContextUsage = () => { throw new Error("host usage unavailable"); };
+  assert(widget.render(220).join("\n").includes("not measured yet"));
+  runtime.ctx.getContextUsage = () => { reads += 1; return getUsage(); };
+  assert(reads > initialReads + 10, "usage was cached between paints");
+  assert.deepEqual({ appended: runtime.appended.length, messages: runtime.messages.length,
+    steered: runtime.steered.length, state: materialized(runtime) }, before,
+    "rendering context usage performed runtime work");
+
+  // Displaying an over-band host estimate must not change the provider-driven trigger.
+  runtime.usage = { tokens: 225_000, contextWindow: 272_000 };
+  assert(widget.render(220).join("\n").includes("at commit point"));
+  const from = runtime.appended.length;
+  await project(runtime);
+  await settle();
+  assert(!contextEvents(runtime, from).some((event) => event.kind === "context.commit" && !event.deferred),
+    "the display fed a trailing host estimate into the provider-driven trigger");
+  const status = (await toolStatus(runtime)).details;
+  assert.equal(status.automatic.providerMeasurement.tokens, 120_000);
+  assert.equal(status.automatic.capacity.budgetTokens, 255_616);
+  assert.equal(status.automatic.capacity.outputReservation, 16_384);
+  const snapshot = runtime.built.snapshot;
+  assert.equal(context.epochCommitDue(snapshot, 204_492 / 272_000), false);
+  assert.equal(context.epochCommitDue(snapshot, 204_493 / 272_000), true);
+
+  // The widget-less fallback also uses Pi, while detailed headroom is labelled Budget.
+  const fallback = makeRuntime(fixture());
+  await startRuntime(fallback);
+  await measure(fallback, 120_000, 272_000);
+  fallback.usage = { tokens: 137_976, contextWindow: 272_000 };
+  await project(fallback);
+  await settle();
+  assert(fallback.statuses.at(-1).text.includes("51% full · commit at 75%"));
+  fallback.usage = { tokens: 225_000, contextWindow: 272_000 };
+  await project(fallback);
+  await settle();
+  assert(fallback.statuses.at(-1).text.includes("at commit point"));
+  assert(!fallback.statuses.at(-1).text.includes("COMMIT DUE"), "a host estimate promised an imminent commit");
+  await fallback.commands.get("fold-status").handler("", fallback.ctx);
+  assert(fallback.notifications.at(-1).message.includes("Budget"));
+
+  // An explicit already-net input budget is never charged the reserve a second time.
+  const net = makeRuntime(fixture(), { providerInputBudget: 251_520 });
+  let netWidget;
+  net.ctx.ui.theme = runtime.ctx.ui.theme;
+  net.ctx.ui.setWidget = (_key, factory) => { netWidget = factory({ requestRender() {} }); };
+  await startRuntime(net);
+  await measure(net, 137_976, 272_000);
+  await project(net);
+  await settle();
+  assert.equal(netWidget.model.share, net.ctx.getContextUsage().percent / 100);
+  assert.equal(netWidget.model.commitShare, .80 * 251_520 / 272_000);
+  assert.equal(netWidget.model.aimShare, .20 * 251_520 / 272_000);
+  assert(netWidget.render(220).join("\n").includes("commit at 74%"));
+  const netStatus = (await toolStatus(net)).details;
+  assert.equal(netStatus.automatic.capacity.budgetTokens, 251_520);
+  assert.equal(netStatus.automatic.capacity.outputReservation, 0);
+  await runtime.handlers.get("session_shutdown")({}, runtime.ctx);
+  assert.deepEqual(widget.render(220), []);
+  return { nativeShare: model.share, commitShare: model.commitShare,
+    aimShare: model.aimShare, servingBudget: status.automatic.capacity.budgetTokens,
+    netCommitShare: netWidget.model.commitShare, hostReads: reads };
+}
+
 async function gateHostPeersAndSdkSession() {
   const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
@@ -18543,6 +18673,7 @@ const gates = [
   [174, "A bounded delta run keeps the replay bounded", gateBoundedDeltaRun],
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],
+  [177, "The fold bar uses Pi context usage on Pi's scale", gateFoldBarUsesPiContextUsage],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],

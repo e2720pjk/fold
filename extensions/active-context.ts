@@ -739,8 +739,8 @@ export function registerActiveContext(pi: any, options: {
   /**
    * THE FOLD BAR. One coloured composition row directly above the footer,
    * drawn by `renderFoldBar` from a model this function rebuilds on every status update.
-   * The component reads the model and the LIVE theme at render time, so it repaints on
-   * a theme switch, which the status string cannot; the host is asked to render after
+   * The component reads Pi's context usage and the LIVE theme at render time. Neither
+   * reading is cached between status events; the host is asked to render after
    * each rebuild. Installed once per host UI, on the first update that finds one.
    */
   const foldBar = {
@@ -753,6 +753,34 @@ export function registerActiveContext(pi: any, options: {
     /** Display-only reconstruction while waiting for the first real context event. */
     startupSnapshot: null as ActiveContextSnapshot | null,
   };
+  // DISPLAY ONLY. Pi owns the live reading, including its unmeasured trailing messages
+  // and post-compaction unknown state. Never substitute our saved provider measurement
+  // or projection estimate. The band remains a share of the SERVING budget: convert its
+  // points onto Pi's full-window axis, without changing any scheduling arithmetic.
+  const foldBarUsage = (ctx: any): Pick<FoldBarModel, "share" | "commitShare" | "aimShare"> => {
+    let usage: unknown;
+    try { usage = ctx.getContextUsage?.(); } catch { }
+    const reportedWindow = ownValue(usage, "contextWindow");
+    const modelWindow = ownValue(ctx.model, "contextWindow");
+    const validWindow = (value: unknown): value is number =>
+      typeof value === "number" && Number.isFinite(value) && value > 0;
+    const window = validWindow(reportedWindow) ? reportedWindow
+      : validWindow(modelWindow) ? modelWindow : DEFAULT_CONTEXT_WINDOW;
+    const tokens = ownValue(usage, "tokens");
+    const percent = ownValue(usage, "percent");
+    const share = validWindow(reportedWindow) && typeof tokens === "number" &&
+      Number.isFinite(tokens) && tokens >= 0 && typeof percent === "number" &&
+      Number.isFinite(percent) && percent >= 0 ? percent / 100 : null;
+    const capacity = capacityAccounting({
+      window: providerInputBudget ?? window,
+      truthful: providerInputBudget !== null,
+      descriptorWindow: window,
+      usedTokens: null,
+    });
+    const budgetShare = capacity.budgetTokens / window;
+    return { share, commitShare: thresholds.maxTarget * budgetShare,
+      aimShare: thresholds.minTarget * budgetShare };
+  };
   const installFoldBar = (ctx: any): void => {
     if (foldBar.installed || typeof ctx.ui?.setWidget !== "function") return;
     foldBar.installed = true;
@@ -760,10 +788,13 @@ export function registerActiveContext(pi: any, options: {
       foldBar.requestRender = () => { try { tui.requestRender(); } catch { } };
       return {
         /** The model behind the row, for the lab and the gates. */
-        get model(): FoldBarModel | null { return foldBar.model; },
+        get model(): FoldBarModel | null {
+          return foldBar.model ? { ...foldBar.model, ...foldBarUsage(ctx) } : null;
+        },
         render(width: number): string[] {
-          if (!foldBar.model) return [];
-          try { return [renderFoldBar(foldBar.model, width, ctx.ui.theme)]; }
+          const model = this.model;
+          if (!model) return [];
+          try { return [renderFoldBar(model, width, ctx.ui.theme)]; }
           catch { return []; }
         },
         invalidate() { },
@@ -771,7 +802,7 @@ export function registerActiveContext(pi: any, options: {
     }, { placement: "belowEditor" });
   };
   const foldBarModel = (ctx: any, input: {
-    share: number | null; staged: number; weighed: boolean;
+    share: number | null; commitShare: number; aimShare: number; staged: number; weighed: boolean;
   }): FoldBarModel => {
     const state = persistence.state;
     // THE SAME SNAPSHOT /fold-status PRICES AGAINST. `markFreedBytes` answers ZERO, silently,
@@ -785,8 +816,8 @@ export function registerActiveContext(pi: any, options: {
     const model: FoldBarModel = {
       brand: brandNoun,
       share: input.share,
-      commitShare: thresholds.maxTarget,
-      aimShare: thresholds.minTarget,
+      commitShare: input.commitShare,
+      aimShare: input.aimShare,
       mapped: false, mass: emptyFoldBarMass(),
       stagedMarks: input.staged,
       folds: 0, foldSpans: 0, foldTruncations: 0, foldConsolidations: 0,
@@ -863,13 +894,13 @@ export function registerActiveContext(pi: any, options: {
       const roots = persistence.state && lifecycle.latestSnapshot ? orderedRoots(persistence.state, lifecycle.latestSnapshot).length : 0;
       const staged = persistence.state ? pendingMarks(persistence.state).length : 0;
       const capacity = currentCapacity(ctx);
-      const used = measurements.lastProviderMeasurement?.tokens ?? null;
-      const share = used !== null && capacity.budgetTokens > 0 ? used / capacity.budgetTokens : null;
+      const usage = foldBarUsage(ctx);
+      const { share } = usage;
       try {
         installFoldBar(ctx);
         if (foldBar.installed) {
           foldBar.model = foldBarModel(ctx, {
-            share, staged,
+            ...usage, staged,
             weighed: ladder.bandTopMeasurement !== null &&
               ladder.bandTopMeasurement === measurements.lastProviderMeasurement,
           });
@@ -889,7 +920,7 @@ export function registerActiveContext(pi: any, options: {
       // in /fold-settings went on being announced at its old value until the next event
       // rebuilt a snapshot. The number this line owes a person is the one that will fire,
       // and that is the runtime's own variable.
-      const trigger = thresholds.maxTarget;
+      const trigger = usage.commitShare;
       // WHEN, not just how full. "68% full" only answers the second question a reader has
       // if they already remember where the trigger sits; naming it answers both.
       //
@@ -911,9 +942,13 @@ export function registerActiveContext(pi: any, options: {
       if (share !== null && !ladder.automaticFailure) {
         const weighed = ladder.bandTopMeasurement !== null &&
           ladder.bandTopMeasurement === measurements.lastProviderMeasurement;
+        // Pi may include a trailing estimate ahead of the last provider count. Being
+        // over the displayed point alone must not promise an imminent runtime commit.
+        const due = capacity.usedTokens !== null &&
+          capacity.usedTokens >= thresholds.maxTarget * capacity.budgetTokens;
         parts.push(share < trigger
           ? `commit at ${Math.round(trigger * 100)}%`
-          : weighed ? "commit held" : "COMMIT DUE");
+          : weighed ? "commit held" : due ? "COMMIT DUE" : "at commit point");
       }
       if (staged > 0) parts.push(`${staged} staged`);
       if (roots > 0) parts.push(`${roots} fold${roots === 1 ? "" : "s"}`);
