@@ -18094,9 +18094,9 @@ async function gateUnreadableLineageWritesNothing() {
 }
 
 /**
- * GATE 176: FORKED STATE AND FOLD GRAPHS ARE REBASED; ANCESTOR RECORDS REPLAY SAFELY.
+ * GATE 178: FORKED STATE AND FOLD GRAPHS ARE REBASED; ANCESTOR RECORDS REPLAY SAFELY.
  */
-async function gateForkRebasesPendingState() {
+async function verifyForkRebasesPendingState() {
   const parentId = "fork-parent";
   const childId = "fork-child";
   const built = makeFixture({ sessionId: parentId, turns: 8, tools: false, chapterChars: 900 });
@@ -18147,7 +18147,10 @@ async function gateForkRebasesPendingState() {
   "valid inherited records still produced restore warnings");
   assert.equal(parentState.data.sessionId, parentId, "rebasing mutated the parent record");
   assert.equal(receipt.data.sessionId, parentId, "receipt handling mutated the parent record");
+  return { rebasedPendingMarks: rebased.pendingMarks.length, childCheckpoint: true };
+}
 
+async function verifyForkRebasesFoldGraph() {
   const folded = await smallChapterForest(2);
   const childFolds = [...folded.state.folds];
   const consolidation = await commitCandidate(folded.state, folded.snapshot, {
@@ -18156,9 +18159,15 @@ async function gateForkRebasesPendingState() {
     sourceRefs: childFolds.flatMap((fold) => context.flattenFoldRefs(fold, folded.state)),
   }, { brief: "A nested parent preserves its independently recoverable chapters.", now: 3 });
   folded.state = consolidation.state;
+  let parentFold = folded.state.folds.find((fold) => fold.kind === "consolidation");
+  for (let level = 0; level < 3; level++) {
+    const parts = [{ kind: "fold", foldId: parentFold.id }];
+    parentFold = { ...parentFold, id: context.foldIdFor("consolidation", parts), parentId: null, parts };
+    folded.state.folds = persistenceModule.deriveFoldParents([...folded.state.folds, parentFold]);
+  }
   const foldedParentId = folded.sessionId;
   const foldedChildId = `${foldedParentId}-fork`;
-  const originalFoldId = folded.state.folds.find((fold) => fold.kind === "consolidation").id;
+  const originalFoldId = parentFold.id;
   const originalRawRef = context.flattenFoldRefs(
     folded.state.folds.find((fold) => fold.id === originalFoldId), folded.state,
   )[0];
@@ -18197,10 +18206,18 @@ async function gateForkRebasesPendingState() {
     entry.customType !== context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY || entry.data.sessionId === foldedChildId);
   const rebasedFolds = context.materializeActiveContextState(childOwnedEntries, foldedChildId);
   assert.equal(rebasedFolds.folds.length, folded.state.folds.length, "the fork dropped committed folds");
-  assert.notEqual(rebasedFolds.folds[0].id, originalFoldId, "the committed fold kept its parent-derived id");
+  assert.notEqual(rebasedFolds.folds[0].id, folded.state.folds[0].id, "the committed fold kept its parent-derived id");
   assert(rebasedFolds.folds.every((fold) => context.flattenFoldRefs(fold, rebasedFolds)
     .every((item) => item.sessionId === foldedChildId)), "a migrated fold retained parent evidence refs");
-  const rebasedParent = rebasedFolds.folds.find((fold) => fold.kind === "consolidation");
+  for (let index = 0; index < folded.state.folds.length; index++) {
+    const originalRefs = context.flattenFoldRefs(folded.state.folds[index], folded.state);
+    const expectedRefs = originalRefs.map((ref) => ({ ...ref, sessionId: foldedChildId }));
+    const actualRefs = context.flattenFoldRefs(rebasedFolds.folds[index], rebasedFolds);
+    assert.deepEqual(actualRefs, expectedRefs, "rebasing changed nested source order or content");
+    assert.equal(rebasedFolds.folds[index].sourceSha256, json.sha256Value(expectedRefs),
+      "rebasing changed the nested source digest");
+  }
+  const rebasedParent = rebasedFolds.folds.find((fold) => fold.kind === "consolidation" && fold.parentId === null);
   assert(rebasedParent, "the nested consolidation fold was not migrated");
   assert.deepEqual(rebasedFolds.expanded, [rebasedParent.id], "expanded state was not re-keyed");
   assert.equal(rebasedFolds.leases[rebasedParent.id], 1, "expand lease was not re-keyed");
@@ -18230,11 +18247,70 @@ async function gateForkRebasesPendingState() {
     entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY).length, 0,
   "reloading a valid rebased fork wrote duplicate state");
 
+  return { rebasedFolds: rebasedFolds.folds.length, reloadStateWrites: 0 };
+}
+
+async function assertForkRestoreRejected(built, state, expectedError, { missingMessages = false } = {}) {
+  const childId = `${built.sessionId}-invalid-fork`;
+  let tail = built.entries.at(-1)?.id ?? null;
+  const records = state.folds.map((fold, index) => {
+    const entry = customEntry(context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY,
+      persistenceModule.makeFoldRecordEntry(fold, built.sessionId), `invalid-parent-fold-${index}`, tail);
+    tail = entry.id;
+    return entry;
+  });
+  const checkpoint = stateEntry(built.sessionId, context.makeStateCheckpoint(state), "invalid-parent-state", tail);
+  const child = makeRuntime({ ...built, sessionId: childId }, {
+    initialEntries: [...built.entries, ...records, checkpoint],
+    parentSession: "invalid-parent.jsonl",
+  });
+  if (missingMessages) child.ctx.sessionManager.buildSessionContext = () => ({ messages: null });
+  await startRuntime(child);
+  assert(child.notifications.some(({ message }) => message.endsWith(`Error: ${expectedError}`)),
+    `fork restore did not report ${expectedError}: ${JSON.stringify(child.notifications)}`);
+  assert(contextEvents(child).some((event) => event.kind === "context.suspend"),
+    "an invalid inherited fork did not suspend folding");
+  assert.equal(child.appended.filter((entry) => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY ||
+    entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY).length, 0,
+  "an invalid inherited fork wrote child-owned state");
+}
+
+async function verifyForkRejectsInvalidState() {
+  const built = makeFixture({ sessionId: "invalid-fork-parent", turns: 8, tools: false, chapterChars: 900 });
+  const ref = built.snapshot.branchObjects[0].ref;
+  const protectedState = (protectedRef) => ({ ...context.emptyActiveContextState(built.sessionId), protected: [protectedRef] });
+  const missingRef = { ...ref, entryId: "absent-entry" };
+  await assertForkRestoreRejected(built, protectedState(missingRef),
+    "Inherited active-context evidence absent-entry is missing or changed in the fork branch");
+  await assertForkRestoreRejected(built, protectedState({ ...ref, sha256: "a".repeat(64) }),
+    `Inherited active-context evidence ${ref.entryId} is missing or changed in the fork branch`);
+  await assertForkRestoreRejected(built, protectedState(ref),
+    "Pi did not provide the fork branch messages needed to rebase active-context state", { missingMessages: true });
+
+  const folded = await smallChapterForest(1);
+  const source = folded.state.folds[0];
+  const parts = source.parts.map((part) => ({ ...part, ref: { ...part.ref, sessionId: "distinct-ancestor" } }));
+  const alternate = { ...source, id: context.foldIdFor(source.kind, parts), parts,
+    sourceSha256: json.sha256Value(parts.map((part) => part.ref)) };
+  const collisionState = persistenceModule.parseActiveContextState({
+    ...folded.state, folds: [source, alternate],
+  }, folded.sessionId);
+  await assertForkRestoreRejected(folded, collisionState, "Invalid active-context fold");
+  // The forest error must still win when curation rebasing also fails.
+  await assertForkRestoreRejected(folded, { ...collisionState, protected: [missingRef] }, "Invalid active-context fold");
+  return 5;
+}
+
+async function gateForkRebasesInheritedState() {
+  const pending = await verifyForkRebasesPendingState();
+  const folded = await verifyForkRebasesFoldGraph();
+  const rejectedInvalidForks = await verifyForkRejectsInvalidState();
   return {
-    rebasedPendingMarks: rebased.pendingMarks.length,
-    rebasedFolds: rebasedFolds.folds.length,
-    childCheckpoint: true,
-    reloadStateWrites: 0,
+    rebasedPendingMarks: pending.rebasedPendingMarks,
+    rebasedFolds: folded.rebasedFolds,
+    childCheckpoint: pending.childCheckpoint,
+    reloadStateWrites: folded.reloadStateWrites,
+    rejectedInvalidForks,
   };
 }
 
@@ -18670,7 +18746,9 @@ async function gateHostPeersAndSdkSession() {
     await session.prompt("Recover the exact folded source.");
     const peek = manager.getBranch().find((entry) => entry.type === "message" &&
       entry.message.role === "toolResult" && entry.message.toolCallId === "sdk-exact-peek");
-    assert(peek && !peek.message.isError, "Pi failed to dispatch the fold tool");
+    assert(peek && !peek.message.isError,
+      `Pi failed to dispatch the fold tool: ${JSON.stringify({ peek, errors, queuedReplies: replies.length,
+        frames: frames.length, lastMessageError: session.agent.state.messages.at(-1)?.errorMessage })}`);
     assert.equal(peek.message.details.source, exact.source);
     assert.equal(peek.message.details.truncated, false);
     assert(frames.some((frame) => JSON.stringify(frame).includes("[pi-fold active-context fold ")),
@@ -18821,7 +18899,7 @@ const gates = [
   // real boundaries on 2026-08-23 the band never opened once in a three-boundary
   // session, so the agent was never invited at all. The number stays spent.
   [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
-  [178, "A fork rebases inherited folds and pending state", gateForkRebasesPendingState],
+  [178, "A fork rebases inherited folds and pending state", gateForkRebasesInheritedState],
   [174, "A bounded delta run keeps the replay bounded", gateBoundedDeltaRun],
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],
