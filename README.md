@@ -27,7 +27,7 @@ Compaction replaces the transcript with a summary and discards the originals. Fo
   <img alt="Compaction turns the transcript into a summary and discards the originals, so the session starts over. pi-fold turns it into a brief and keeps the exact originals on disk, one peek or expand away, so the session keeps going." src="https://raw.githubusercontent.com/shaneconner/fold/main/media/fold-vs-compaction-light.svg">
 </picture>
 
-A fold takes a contiguous span of session entries and replaces it, in the window only, with a short brief. The entries go to a fold store byte for byte, addressed by their SHA-256 hash. The brief carries a handle, the handle resolves to the original, and expansion restores the exact bytes after verifying the hash.
+A fold takes a contiguous span of session entries and replaces it, in the window only, with a short brief. The entries stay in Pi's session file byte for byte; the fold finds them by Pi's own entry ids and records each one's SHA-256 hash when it folds. The brief carries a handle, the handle resolves to the originals, and expansion restores them as Pi holds them. If an entry's bytes no longer match the recorded hash, the fold still stands and the change is logged as a `context.drift` event.
 
 The package registers one tool, `pi_fold_context`, with nine actions over the transcript: `status`, `peek`, `brief`, `expand`, `refold`, `pin`, `unpin`, `reboundary` and `unmark`. A session that never calls the tool still folds; it degrades into lossless hierarchical compaction.
 
