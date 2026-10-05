@@ -740,8 +740,8 @@ export function registerActiveContext(pi: any, options: {
    * THE FOLD BAR. One coloured composition row directly above the footer,
    * drawn by `renderFoldBar` from a model this function rebuilds on every status update.
    * The component reads Pi's context usage and the LIVE theme at render time. Neither
-   * reading is cached between status events; the host is asked to render after
-   * each rebuild. Installed once per host UI, on the first update that finds one.
+   * reading waits for a status event; the host is asked to render after each rebuild.
+   * Installed once per host UI, on the first update that finds one.
    */
   const foldBar = {
     model: null as FoldBarModel | null,
@@ -752,14 +752,41 @@ export function registerActiveContext(pi: any, options: {
     staleSince: null as unknown,
     /** Display-only reconstruction while waiting for the first real context event. */
     startupSnapshot: null as ActiveContextSnapshot | null,
+    /** Pi's last usage reading and the session state it was read against. */
+    usageKey: null as unknown[] | null,
+    usage: undefined as unknown,
+  };
+  // MIRROR THE FOOTER'S READING, ON THE FOOTER'S KEY. getContextUsage rebuilds the whole
+  // session projection per call (29 ms on a 16,218-entry session) and the bar renders
+  // every frame. Pi's own footer re-reads only when the session, session id, leaf, entry
+  // count or model moves (FooterComponent.getSessionStats), since entries are append-only
+  // and every append moves the leaf. Read on exactly those moves and we show the same
+  // value at the same moments, without paying for it per frame.
+  const piContextUsage = (ctx: any): unknown => {
+    let key: unknown[] | null = null;
+    try {
+      // No leaf to key on means no way to know the reading moved: read every time.
+      const manager = ctx.sessionManager;
+      if (typeof manager?.getLeafId !== "function") throw new Error("no session leaf");
+      key = [manager, manager.getSessionId?.(), manager.getLeafId(),
+        manager.getEntryCount?.(), ctx.model];
+      const cached = foldBar.usageKey;
+      if (cached && cached.length === key.length && cached.every((value, i) => value === key![i])) {
+        return foldBar.usage;
+      }
+    } catch { key = null; }
+    let usage: unknown;
+    try { usage = ctx.getContextUsage?.(); } catch { }
+    foldBar.usageKey = key;
+    foldBar.usage = usage;
+    return usage;
   };
   // DISPLAY ONLY. Pi owns the live reading, including its unmeasured trailing messages
   // and post-compaction unknown state. Never substitute our saved provider measurement
   // or projection estimate. The band remains a share of the SERVING budget: convert its
   // points onto Pi's full-window axis, without changing any scheduling arithmetic.
   const foldBarUsage = (ctx: any): Pick<FoldBarModel, "share" | "percent" | "commitShare" | "aimShare"> => {
-    let usage: unknown;
-    try { usage = ctx.getContextUsage?.(); } catch { }
+    const usage = piContextUsage(ctx);
     const reportedWindow = ownValue(usage, "contextWindow");
     const modelWindow = ownValue(ctx.model, "contextWindow");
     const validWindow = (value: unknown): value is number =>

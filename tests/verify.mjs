@@ -399,6 +399,7 @@ function makeRuntime(built, {
       getBranch: () => branch,
       getEntries: () => branch,
       getLeafId: () => branch.at(-1)?.id ?? null,
+      getEntryCount: () => branch.length,
       getEntry: (id) => branch.find((entry) => entry.id === id) ?? null,
       buildContextEntries: () => branch,
       // Rebuilt from the TREE, the way pi rebuilds it, which is what makes the
@@ -18306,6 +18307,8 @@ async function gateFoldProvenOncePerReplay() {
 // Only the provider stream is synthetic: Pi owns dispatch, tools, projection and reload.
 /** GATE 177: Pi's live usage owns the display, not our last measured serving ratio.
  * Repaints are reads only; band points change coordinates, never scheduling semantics.
+ * The bar MIRRORS the footer's reading on the footer's key (session, id, leaf, entry
+ * count, model): a repaint at an unmoved key never asks Pi again, and any move does.
  */
 async function gateFoldBarUsesPiContextUsage() {
   const fixture = () => makeFixture({ turns: 8, resultChars: 3_000,
@@ -18317,6 +18320,15 @@ async function gateFoldBarUsesPiContextUsage() {
   let reads = 0;
   const getUsage = runtime.ctx.getContextUsage;
   runtime.ctx.getContextUsage = () => { reads += 1; return getUsage(); };
+  // Pi's usage only changes when the session moves, and every append moves the leaf.
+  // A thinking-level change is a real Pi entry that moves it without any message.
+  let moves = 0;
+  const piMoves = (target, usage) => {
+    if (usage !== undefined) target.usage = usage;
+    target.branch.push({ type: "thinking_level_change", thinkingLevel: "max",
+      id: `usage-move-${String(++moves).padStart(4, "0")}`,
+      parentId: target.branch.at(-1)?.id ?? null });
+  };
   runtime.ctx.ui.theme = { fg: (_c, text) => text, bold: (text) => text };
   runtime.ctx.ui.setWidget = (_key, factory) => { widget = factory({ requestRender() {} }); };
   await startRuntime(runtime);
@@ -18324,10 +18336,9 @@ async function gateFoldBarUsesPiContextUsage() {
   await project(runtime);
   await settle();
   // Pi includes trailing messages. Deliberately differ from the saved provider count.
-  runtime.usage = { tokens: 137_976, contextWindow: 272_000 };
+  piMoves(runtime, { tokens: 137_976, contextWindow: 272_000 });
   const before = { appended: runtime.appended.length, messages: runtime.messages.length,
     steered: runtime.steered.length, state: materialized(runtime) };
-  const initialReads = reads;
   const model = widget.model;
   assert.equal(model.share, getUsage().percent / 100, "the bar does not use Pi's reported percent");
   assert.notEqual(model.share, 120_000 / 255_616, "the provider/serving ratio still owns the display");
@@ -18338,18 +18349,18 @@ async function gateFoldBarUsesPiContextUsage() {
   assert.equal(context.foldBarTicks(model).get(29), "commit");
 
   // Fresh Pi values must reach the SAME component without a lifecycle/status update.
-  runtime.usage = { tokens: 40_000, contextWindow: 400_000 };
+  piMoves(runtime, { tokens: 40_000, contextWindow: 400_000 });
   assert(widget.render(220).join("\n").includes("10% · commit at 77%"));
   assert.equal(widget.model.commitShare, .80 * (400_000 - 16_384) / 400_000);
   assert.deepEqual(widget.model.mass, model.mass, "a live reading remapped composition");
   // Consume the API percent as given, rather than building a competing percentage.
-  runtime.usage = { tokens: 40_000, percent: 12.5, contextWindow: 400_000 };
+  piMoves(runtime, { tokens: 40_000, percent: 12.5, contextWindow: 400_000 });
   assert.equal(widget.model.share, .125);
   // Floor only the label, matching the footer. Preserve the original API percent:
   // 29 / 100 * 100 is 28.999..., and must not turn an exact 29% into 28%.
   const displayPercents = [12.5, 27.8, 29, 57, 58, 29 - Number.EPSILON * 16, 100.9];
   for (const percent of displayPercents) {
-    runtime.usage = { tokens: 40_000, percent, contextWindow: 400_000 };
+    piMoves(runtime, { tokens: 40_000, percent, contextWindow: 400_000 });
     const live = widget.model;
     const label = Math.floor(percent);
     assert.equal(live.percent, percent, "the original Pi percentage was lost");
@@ -18363,7 +18374,7 @@ async function gateFoldBarUsesPiContextUsage() {
   // Pure renderer callers without a host percent retain a share-only model.
   assert(context.foldBarPlainText({ ...model, share: .278, percent: undefined }).includes("27% · "));
   // A valid zero is not an unknown reading. No saved value may fill an unknown gap.
-  runtime.usage = { tokens: 0, percent: 0, contextWindow: 272_000 };
+  piMoves(runtime, { tokens: 0, percent: 0, contextWindow: 272_000 });
   assert.equal(widget.model.share, 0);
   for (const usage of [
     { tokens: null, percent: null, contextWindow: 272_000 },
@@ -18374,23 +18385,60 @@ async function gateFoldBarUsesPiContextUsage() {
     { tokens: -1, percent: -1, contextWindow: 272_000 },
     { tokens: 137_976, percent: 50, contextWindow: 0 },
   ]) {
-    runtime.usage = usage;
+    piMoves(runtime, usage);
     const row = widget.render(220).join("\n");
     assert(row.includes("not measured yet") && !/[█▌░]/.test(row), row);
     assert.equal(widget.model.share, null, "an unknown host reading used a cached/local count");
   }
   runtime.ctx.getContextUsage = () => undefined;
+  piMoves(runtime);
   assert(widget.render(220).join("\n").includes("not measured yet"));
   runtime.ctx.getContextUsage = () => { throw new Error("host usage unavailable"); };
+  piMoves(runtime);
   assert(widget.render(220).join("\n").includes("not measured yet"));
   runtime.ctx.getContextUsage = () => { reads += 1; return getUsage(); };
-  assert(reads > initialReads + 10, "usage was cached between paints");
+  piMoves(runtime, { tokens: 40_000, percent: 33, contextWindow: 400_000 });
+  // A frame is not a move: repaints at an unmoved key reuse the reading, the way the
+  // footer's getSessionStats does, because one read rebuilds the whole projection.
+  const settledReads = reads;
+  for (let frame = 0; frame < 25; frame += 1) widget.render(220);
+  assert(widget.render(220).join("\n").includes("33% · "));
+  assert.equal(reads, settledReads + 1, "repaints at an unmoved session re-read Pi's usage");
+  // Each footer key moves the reading exactly once: a new leaf, an entry that does not
+  // move the leaf, and a model switch. The new value lands with no lifecycle event.
+  const keyMoves = [
+    ["leaf", () => piMoves(runtime, { tokens: 40_000, percent: 34, contextWindow: 400_000 }), 34],
+    ["entry count", () => {
+      runtime.usage = { tokens: 40_000, percent: 35, contextWindow: 400_000 };
+      runtime.branch.splice(runtime.branch.length - 1, 0, { type: "label",
+        id: `usage-label-${moves}`, parentId: null });
+    }, 35],
+    // /tree navigation to a sibling moves the leaf over entries already in the file.
+    ["tree navigation", () => {
+      runtime.usage = { tokens: 40_000, percent: 37, contextWindow: 400_000 };
+      const leaf = runtime.branch.at(-1);
+      assert(leaf.id.startsWith("usage-move-"), "navigation must only replace a usage move");
+      runtime.branch[runtime.branch.length - 1] = { ...leaf, id: `${leaf.id}-sibling` };
+    }, 37],
+    ["model", () => {
+      runtime.usage = { tokens: 40_000, percent: 38, contextWindow: 400_000 };
+      runtime.ctx.model = { ...runtime.ctx.model };
+    }, 38],
+  ];
+  for (const [name, move, percent] of keyMoves) {
+    const at = reads;
+    move();
+    for (let frame = 0; frame < 5; frame += 1) {
+      assert(widget.render(220).join("\n").includes(`${percent}% · `), `a ${name} move kept a stale reading`);
+    }
+    assert.equal(reads, at + 1, `a ${name} move read Pi's usage ${reads - at} times, not once`);
+  }
   assert.deepEqual({ appended: runtime.appended.length, messages: runtime.messages.length,
     steered: runtime.steered.length, state: materialized(runtime) }, before,
     "rendering context usage performed runtime work");
 
   // Displaying an over-band host estimate must not change the provider-driven trigger.
-  runtime.usage = { tokens: 225_000, contextWindow: 272_000 };
+  piMoves(runtime, { tokens: 225_000, contextWindow: 272_000 });
   assert(widget.render(220).join("\n").includes("at commit point"));
   const from = runtime.appended.length;
   await project(runtime);
