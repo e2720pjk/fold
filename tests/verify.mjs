@@ -18671,6 +18671,74 @@ function fixture178(built) {
   return { ...built, entries: structuredClone(built.entries), messages: structuredClone(built.messages) };
 }
 
+/** GATE 179: A folded entry is found by Pi's identity, not by its bytes.
+ * Session 01a10834: one assistant message hashed differently live than as persisted (1 of
+ * 3,686 refs). On resume its root could not be seated, the next commit erased the root's
+ * 377 folds and the request went out at ~1.49M tokens against a 1M window. Here a parent
+ * fold over three children is committed, one folded entry's persisted bytes then differ,
+ * and a fresh runtime loads the file: the parent must still stand, a commit must keep every
+ * fold, and the drift must be recorded once.
+ */
+async function gateFoldSurvivesContentDrift() {
+  const built = makeFixture({ turns: 8, resultChars: 2_000, contextWindow: 1_000_000,
+    thresholds: TINY_FOLD_FLOOR, sessionId: "content-drift" });
+  built.snapshot = context.mapActiveContext({ sessionId: built.sessionId, eventMessages: built.messages,
+    contextEntries: built.entries, contextWindow: 1_000_000, thresholds: TINY_FOLD_FLOOR });
+  let state = context.emptyActiveContextState(built.sessionId);
+  const fold = async (from, to, brief, now) => {
+    const ids = [built.turnEntries[from][0], built.turnEntries[to].at(-1)];
+    state = (await commitCandidate(state, built.snapshot, context.manualFoldCandidate(built.snapshot, state, ids),
+      { brief, now })).state;
+  };
+  for (const turn of [1, 2, 3]) await fold(turn, turn, `Turn ${turn} read its file and reported.`, turn);
+  await fold(1, 4, "Turns 1 to 4 read their files and reported.", 9);
+  const parent = state.folds.find((item) => item.parentId === null);
+  assert(parent && state.folds.filter((item) => item.parentId === parent.id).length === 3,
+    "the fixture owes one root over three child folds");
+  const foldIds = state.folds.map((item) => item.id).sort();
+
+  // The persisted bytes of one folded assistant message are not the bytes it was folded
+  // with: a field the live object carried that the file does not.
+  const driftedId = built.turnEntries[2].at(-1);
+  const drifted = built.entries.find((entry) => entry.id === driftedId);
+  assert.equal(drifted.message.role, "assistant");
+  drifted.message.diagnostics = [{ type: "persisted-only" }];
+  built.messages = built.entries.flatMap(context.sessionEntryMessages);
+
+  const thresholds = { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 10, minFoldChars: 1_000_000 };
+  const runtime = makeRuntime(built, { thresholds, initialEntries: [
+    ...built.entries, stateEntry(built.sessionId, state, "drift-state", built.entries.at(-1).id),
+  ] });
+  runtime.ctx.sessionManager.buildSessionContext = () => ({ messages: runtime.branch.flatMap(context.sessionEntryMessages) });
+  await startRuntime(runtime);
+  await measure(runtime, 200_000, 1_000_000);
+  const result = await project(runtime);
+  await settle();
+  const snapshot = context.mapActiveContext({ sessionId: built.sessionId, eventMessages: runtime.messages,
+    contextEntries: runtime.branch, contextWindow: 1_000_000, thresholds });
+  const loaded = materialized(runtime);
+  const roots = context.orderedRoots(loaded, snapshot);
+  assert.deepEqual(roots.map((root) => root.fold.id), [parent.id], "the drifted entry unseated its root");
+  const ref = context.flattenFoldRefs(parent, loaded).find((item) => item.entryId === driftedId);
+  assert(context.contentDrifted(snapshot, ref), "the fixture did not drift the entry's bytes");
+  const projected = result.messages;
+  assert(projected.length < runtime.messages.length - 10, "the root's span went out raw");
+  assert(!projected.some((message) => message.diagnostics), "the drifted message went out raw");
+
+  // A commit after the reload keeps every fold: nothing beneath the root is erased.
+  await measureAndCommit(runtime, 850_000, 1_000_000);
+  const after = materialized(runtime);
+  for (const id of foldIds) assert(after.folds.some((item) => item.id === id), `commit erased fold ${id}`);
+
+  // Recorded, once per entry, never silent.
+  await project(runtime);
+  await settle();
+  const drift = contextEvents(runtime).filter((event) => event.kind === "context.drift");
+  assert.equal(drift.length, 1, `drift was recorded ${drift.length} times`);
+  assert.deepEqual(drift[0].entry_ids, [driftedId]);
+  return { folds: foldIds.length, projected: projected.length, raw: runtime.messages.length };
+}
+
 async function gateHostPeersAndSdkSession() {
   const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
@@ -18919,6 +18987,7 @@ const gates = [
   [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],
   [177, "The fold bar uses Pi context usage on Pi's scale", gateFoldBarUsesPiContextUsage],
   [178, "The chat mirrors the model's window", gateTranscriptMirrorsModelWindow],
+  [179, "A folded entry is found by Pi's identity, not by its bytes", gateFoldSurvivesContentDrift],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],

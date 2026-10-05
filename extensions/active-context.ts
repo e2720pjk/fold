@@ -52,6 +52,7 @@ import {
   latestProviderContextMeasurement,
   orderedRoots,
   parseNativeCompactionCompletion,
+  contentDrifted,
   exactMapped,
   foldInterval,
   parseNativeCompactionDecision,
@@ -3396,6 +3397,24 @@ export function registerActiveContext(pi: any, options: {
     return changed;
   };
 
+  // A FOLDED ENTRY WHOSE BYTES CHANGED (2026-10-05). The fold still stands over it, by Pi's
+  // identity (lib/measurement exactMapped); what changed is recorded once per entry per
+  // process, so the drift is on the record instead of silently unseating the fold.
+  const reportedDrift = new Set<string>();
+  const recordContentDrift = (snapshot: ActiveContextSnapshot): void => {
+    const state = persistence.state;
+    if (!state) return;
+    const drifted: string[] = [];
+    for (const fold of state.folds) {
+      for (const part of fold.parts) {
+        if (part.kind !== "raw" || reportedDrift.has(part.ref.entryId)) continue;
+        if (!contentDrifted(snapshot, part.ref)) continue;
+        reportedDrift.add(part.ref.entryId);
+        drifted.push(part.ref.entryId);
+      }
+    }
+    if (drifted.length) emit("context.drift", { entries: drifted.length, entry_ids: drifted.slice(0, 64) });
+  };
   const handleContext = async (event: { messages: unknown[] }, ctx: any) => {
     if (lifecycle.shuttingDown) return { messages: event.messages };
     beginMutationPass();
@@ -3412,6 +3431,7 @@ export function registerActiveContext(pi: any, options: {
       const snapshot = snapshotForEvent(ctx, event.messages);
       lifecycle.latestSnapshot = snapshot;
       foldBar.startupSnapshot = null;
+      recordContentDrift(snapshot);
       if (ladder.automaticFailure) {
         ladder.automaticFailure.suppressedCallbacks = Math.min(
           Number.MAX_SAFE_INTEGER,

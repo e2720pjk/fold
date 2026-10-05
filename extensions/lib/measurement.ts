@@ -50,10 +50,23 @@ export function mappedByKey(snapshot: ActiveContextSnapshot): Map<string, Mapped
   return indexed;
 }
 
+// A FOLDED ENTRY IS FOUND BY PI'S IDENTITY, NOT BY ITS BYTES (2026-10-05). Pi names every
+// entry (session, entry id, role) and the transcript it hands back is the truth for that
+// entry. This also required the content digest recorded at fold time to match, and one
+// assistant message in session 01a10834 hashed differently live than as persisted (1 of
+// 3,686 refs, cause unidentified): on resume its root could not be seated, the commit
+// that followed erased the root's 377 folds, and the request went out at ~1.49M tokens
+// against a 1M window. A fold over an entry whose bytes changed now stands over Pi's
+// current bytes; `contentDrifted` names the case so it is recorded rather than silent.
 export function exactMapped(snapshot: ActiveContextSnapshot, ref: EvidenceRef): MappedMessage | null {
   const item = mappedByKey(snapshot).get(objectRefKey(ref));
-  return item && sameObjectIdentity(item.ref!, ref) && item.ref!.sha256 === ref.sha256 &&
-    evidenceSha256(item.message) === ref.sha256 ? item : null;
+  return item && sameObjectIdentity(item.ref!, ref) ? item : null;
+}
+
+/** The entry is where the ref says, but its bytes are not the ones it was folded with. */
+export function contentDrifted(snapshot: ActiveContextSnapshot, ref: EvidenceRef): boolean {
+  const item = exactMapped(snapshot, ref);
+  return item !== null && item.ref!.sha256 !== ref.sha256;
 }
 
 export function refsInOrder(snapshot: ActiveContextSnapshot, refs: EvidenceRef[]): number[] | null {

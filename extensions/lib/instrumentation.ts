@@ -99,7 +99,8 @@ export type ContextEventKind =
   | "context.projection"
   | "context.usage"
   | "context.prefix"
-  | "context.anchor";
+  | "context.anchor"
+  | "context.drift";
 
 export function prefixDivergence(
   previous: string | null,
