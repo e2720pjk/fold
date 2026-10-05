@@ -69,8 +69,15 @@ export function contentDrifted(snapshot: ActiveContextSnapshot, ref: EvidenceRef
   return item !== null && item.ref!.sha256 !== ref.sha256;
 }
 
+// PI NEVER SHOWS AN EXTENSION ITS SYSTEM MESSAGES (2026-10-05). The context event filters
+// role "system" (ExtensionRunner.emitContext), so a system-prompt-change entry has no
+// place in the window and cannot break a span. Folds cut from a view that did include them
+// (a `/fold` before the first context event, session 01a10161) carry such refs; they are
+// skipped here rather than unseating the fold and, at the next commit, its whole subtree.
 export function refsInOrder(snapshot: ActiveContextSnapshot, refs: EvidenceRef[]): number[] | null {
-  const indices = refs.map((ref) => exactMapped(snapshot, ref)?.index ?? -1);
+  const placed = refs.filter((ref) => ref.role !== "system");
+  if (!placed.length) return null;
+  const indices = placed.map((ref) => exactMapped(snapshot, ref)?.index ?? -1);
   if (indices.some((index) => index < 0) || new Set(indices).size !== indices.length) return null;
   for (let index = 1; index < indices.length; index += 1) if (indices[index] !== indices[index - 1] + 1) return null;
   return indices;

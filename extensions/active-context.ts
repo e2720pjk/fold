@@ -1157,6 +1157,18 @@ export function registerActiveContext(pi: any, options: {
     }
   };
 
+  // WHAT PI'S CONTEXT EVENT WOULD HAND OVER, BEFORE ONE HAS ARRIVED (2026-10-05). Pi's
+  // ExtensionRunner.emitContext filters role "system" before any handler sees a message;
+  // buildSessionContext does not. A `/fold` before the first context event cut folds from
+  // the unfiltered view in session 01a10161: spans that crossed a system-prompt change
+  // looked broken, and that commit erased 739 of 920 folds.
+  const piContextMessages = (ctx: any): unknown[] | null => {
+    const messages = ctx.sessionManager.buildSessionContext?.()?.messages;
+    return Array.isArray(messages)
+      ? messages.filter((message: any) => message?.role !== "system")
+      : null;
+  };
+
   const snapshotForEvent = (ctx: any, messages: unknown[]): ActiveContextSnapshot =>
     timedDerivation(() => mapActiveContext({
     sessionId: ctx.sessionManager.getSessionId(),
@@ -1352,7 +1364,7 @@ export function registerActiveContext(pi: any, options: {
     persistence.deltasSinceCheckpoint = restoredPersistence?.deltasSinceCheckpoint ?? 0;
     persistence.persistedFoldRecords = restoredPersistence?.records ?? new Map<string, FoldRecordEntry>();
     persistence.persistedStateSha256 = restoredPersistence?.stateSha256 ?? semanticStateSha256(durableRestored);
-    const restoredMessages = ctx.sessionManager.buildSessionContext?.()?.messages;
+    const restoredMessages = piContextMessages(ctx);
     measurements.lastProviderMeasurement = latestProviderContextMeasurement(
       Array.isArray(restoredMessages) ? restoredMessages : [],
       budgetWindowFor(ctx),
@@ -3897,6 +3909,26 @@ export function registerActiveContext(pi: any, options: {
       try { updateStatus(ctx); } catch { }
       return undefined;
     }
+    // PI CHECKS BEFORE THE FIRST PROMPT, BEFORE ANY CONTEXT EVENT (2026-10-05). After a
+    // context_edit (Pi's own retry recovery writes one per failed attempt) Pi stops trusting
+    // the last provider count and estimates the whole raw transcript, folds unseen: 134% on
+    // session 01a10834, 260% on 01a10161. This used to throw for want of a snapshot, suspend
+    // folding and let native compaction run, which ran Pi out of memory on a 272MB session.
+    // The context event that follows projects and commits on the projection itself, so the
+    // boundary is cancelled and folding stays on.
+    const currentSnapshot = lifecycle.latestSnapshot;
+    if (!currentSnapshot || currentSnapshot.sessionId !== ctx.sessionManager.getSessionId()) {
+      nativeCompaction.lastThresholdDecision = {
+        handled: true,
+        retry: false,
+        reason: `${contextBrand(brandNoun)} blocked stock automatic compaction before the first context event; ` +
+          "the projection is measured when the request is built",
+        compactionReason: reason,
+        nativeCompactionCompleted: false,
+      };
+      try { updateStatus(ctx); } catch { }
+      return { cancel: true };
+    }
     let handoff: Record<string, unknown> | null = null;
     try {
       const snapshot = authoritativeSnapshotFor(ctx);
@@ -4794,7 +4826,7 @@ export function registerActiveContext(pi: any, options: {
       if (!persistence.state) persistence.state = emptyActiveContextState(ctx.sessionManager.getSessionId());
       const snapshot = lifecycle.latestSnapshot
         ? authoritativeSnapshotFor(ctx)
-        : snapshotForEvent(ctx, ctx.sessionManager.buildSessionContext().messages);
+        : snapshotForEvent(ctx, piContextMessages(ctx) ?? []);
       if (!lifecycle.latestSnapshot) lifecycle.latestSnapshot = snapshot;
       const divider = args.indexOf(" -- ");
       const selector = (divider >= 0 ? args.slice(0, divider) : args).trim();
@@ -4904,7 +4936,7 @@ export function registerActiveContext(pi: any, options: {
     }
     const snapshot = lifecycle.latestSnapshot
       ? authoritativeSnapshotFor(ctx)
-      : snapshotForEvent(ctx, ctx.sessionManager.buildSessionContext().messages);
+      : snapshotForEvent(ctx, piContextMessages(ctx) ?? []);
     if (!lifecycle.latestSnapshot) lifecycle.latestSnapshot = snapshot;
     if (!persistence.state) throw new Error("The context window is empty; there is nothing to show yet");
 

@@ -18739,6 +18739,89 @@ async function gateFoldSurvivesContentDrift() {
   return { folds: foldIds.length, projected: projected.length, raw: runtime.messages.length };
 }
 
+/** GATE 180: Pi's system messages are never part of the window, before or after the
+ * first context event. Pi's context event filters role "system"; buildSessionContext does
+ * not. Session 01a10161: a `/fold` before the first context event cut from the unfiltered
+ * view, so folds crossing a system-prompt change looked broken and that commit erased 739
+ * of 920 folds, and the next restart's pre-prompt compaction suspended folding and ran
+ * native compaction out of memory. Here: a compaction boundary before any context event is
+ * cancelled without suspending; `/fold` before any context event keeps every fold that
+ * crosses the system message; the real context event seats every root; and a fold that
+ * already carries a system ref still seats.
+ */
+async function gateSystemMessagesStayOutOfTheWindow() {
+  const built = makeFixture({ turns: 8, resultChars: 2_000, contextWindow: 1_000_000,
+    thresholds: TINY_FOLD_FLOOR, sessionId: "system-prompt-change" });
+  const after = built.entries.findIndex((entry) => entry.id === built.turnEntries[1].at(-1));
+  const system = { type: "message", id: "system-change", parentId: built.entries[after].id,
+    message: { role: "system", content: "", sections: { project_context: "AGENTS.md changed" },
+      timestamp: 99_999 } };
+  built.entries.splice(after + 1, 0, system);
+  built.entries[after + 2].parentId = system.id;
+  // What Pi's context event hands an extension: no system messages.
+  built.messages = built.entries.flatMap(context.sessionEntryMessages).filter((message) => message.role !== "system");
+  built.snapshot = context.mapActiveContext({ sessionId: built.sessionId, eventMessages: built.messages,
+    contextEntries: built.entries, contextWindow: 1_000_000, thresholds: TINY_FOLD_FLOOR });
+  let state = context.emptyActiveContextState(built.sessionId);
+  const candidate = (from, to) => context.manualFoldCandidate(built.snapshot, state,
+    [built.turnEntries[from][0], built.turnEntries[to].at(-1)]);
+  state = (await commitCandidate(state, built.snapshot, candidate(1, 3),
+    { brief: "Turns 1 to 3 read their files across a system prompt change.", now: 1 })).state;
+  state = (await commitCandidate(state, built.snapshot, candidate(5, 5),
+    { brief: "Turn 5 read its file.", now: 2 })).state;
+  const crossing = state.folds.find((fold) => context.flattenFoldRefs(fold, state)
+    .some((ref) => ref.entryId === built.turnEntries[1][0]));
+  assert(crossing, "the fixture owes a fold across the system message");
+  const mark = context.foldMarkFor({ candidate: candidate(6, 6), brief: "Turn 6 read its file.",
+    briefProvenance: { kind: "deterministic" }, origin: "user", ordinal: 1 });
+  state = context.withPendingMarks(state, [mark]);
+  const foldIds = state.folds.map((fold) => fold.id);
+
+  const thresholds = { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 10, minFoldChars: 1_000_000 };
+  const runtime = makeRuntime(built, { thresholds, initialEntries: [
+    ...built.entries, stateEntry(built.sessionId, state, "system-state", built.entries.at(-1).id),
+  ] });
+  // Pi's own reconstruction keeps the system message.
+  runtime.ctx.sessionManager.buildSessionContext = () => ({ messages: runtime.branch.flatMap(context.sessionEntryMessages) });
+  await runtime.handlers.get("session_start")({}, runtime.ctx);
+
+  // Pi's pre-prompt compaction check, before any context event in this process.
+  const boundary = await compactBoundary(runtime);
+  assert.equal(boundary?.cancel, true, "native compaction ran before the first context event");
+  assert(!contextEvents(runtime).some((event) => event.kind === "context.suspend"),
+    "the boundary before the first context event suspended folding");
+
+  // `/fold` before any context event commits the staged mark and keeps every fold.
+  await runtime.commands.get("fold").handler("", runtime.ctx);
+  const committed = materialized(runtime);
+  for (const id of foldIds) assert(committed.folds.some((fold) => fold.id === id), `/fold erased fold ${id}`);
+  assert(committed.folds.some((fold) => fold.id === mark.id), "/fold did not commit the staged mark");
+  assert(!committed.folds.some((fold) => context.flattenFoldRefs(fold, committed)
+    .some((ref) => ref.role === "system")), "/fold cut a system message into a fold");
+
+  // The real context event seats every root and sends the folds folded.
+  const result = await project(runtime);
+  await settle();
+  const snapshot = context.mapActiveContext({ sessionId: built.sessionId, eventMessages: runtime.messages,
+    contextEntries: runtime.branch, contextWindow: 1_000_000, thresholds });
+  const loaded = materialized(runtime);
+  assert.equal(context.orderedRoots(loaded, snapshot).length, loaded.folds.filter((fold) => !fold.parentId).length,
+    "a root did not seat at the first real context event");
+  assert(result.messages.length < runtime.messages.length - 6, "the folds went out raw");
+  assert(!contextEvents(runtime).some((event) => event.kind === "context.suspend"));
+
+  // A fold already carrying a system ref (cut by an older build) still seats.
+  const systemRef = { sessionId: built.sessionId, entryId: system.id, role: "system",
+    sha256: context.sha256Value(system.message) };
+  const refs = context.flattenFoldRefs(crossing, loaded);
+  const at = refs.findIndex((ref) => ref.entryId === built.turnEntries[2][0]);
+  const withSystem = [...refs.slice(0, at), systemRef, ...refs.slice(at)];
+  assert.deepEqual(context.refsInOrder(snapshot, withSystem), context.refsInOrder(snapshot, refs),
+    "a system ref unseated a fold");
+  assert.equal(context.refsInOrder(snapshot, [systemRef]), null, "a fold of nothing placeable seated");
+  return { folds: loaded.folds.length, projected: result.messages.length, raw: runtime.messages.length };
+}
+
 async function gateHostPeersAndSdkSession() {
   const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
@@ -18988,6 +19071,7 @@ const gates = [
   [177, "The fold bar uses Pi context usage on Pi's scale", gateFoldBarUsesPiContextUsage],
   [178, "The chat mirrors the model's window", gateTranscriptMirrorsModelWindow],
   [179, "A folded entry is found by Pi's identity, not by its bytes", gateFoldSurvivesContentDrift],
+  [180, "Pi's system messages stay out of the window", gateSystemMessagesStayOutOfTheWindow],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],
