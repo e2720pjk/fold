@@ -35,6 +35,7 @@ import {
   requireActiveFold,
   selectAutomaticRung,
   setFoldProjectionState,
+  visibleCollapsedFolds,
   withExpandLease,
 } from "./lib/folding.ts";
 import {
@@ -206,6 +207,12 @@ import type {
 import { buildActiveContextCommands, buildActiveContextTool } from "./lib/tool-surface.ts";
 import { buildFoldEditorData, FoldEditorView } from "./lib/editor-ui.ts";
 import { publishLiveSettings } from "./lib/live-settings.ts";
+import {
+  foldedChildren,
+  locateChatContainer,
+  type MirrorFold,
+  unfoldedChildren,
+} from "./lib/transcript-mirror.ts";
 import {
   entryText,
   mapActiveContext,
@@ -781,6 +788,71 @@ export function registerActiveContext(pi: any, options: {
     foldBar.usage = usage;
     return usage;
   };
+  /**
+   * THE CHAT SHOWS THE MODEL'S WINDOW (2026-10-04, lib/transcript-mirror.ts). The PLAN
+   * is the folds the model holds collapsed, rebuilt on every status update and keyed by
+   * which folds those are, so a commit, an expansion and a refold each move it. The
+   * chat is re-folded only when the key moved or Pi repainted the chat (a repaint swaps
+   * the container's children array), checked on the fold bar's frame: two comparisons
+   * per frame, one pass over the chat per change. DISPLAY ONLY: it reads runtime state
+   * and writes nothing but Pi's chat container, and a failure leaves Pi's own transcript.
+   */
+  const transcriptMirror = {
+    tui: null as unknown,
+    chat: null as { children: unknown[] } | null,
+    ctx: null as any,
+    plan: [] as MirrorFold[],
+    planKey: "",
+    applied: null as unknown[] | null,
+    appliedKey: "",
+  };
+  const planTranscript = (ctx: any): void => {
+    transcriptMirror.ctx = ctx;
+    const state = persistence.state;
+    let snapshot = lifecycle.latestSnapshot ?? foldBar.startupSnapshot;
+    try { snapshot = authoritativeSnapshotFor(ctx); } catch { }
+    const folds = state && snapshot ? visibleCollapsedFolds(state, snapshot) : [];
+    const key = folds.map((fold) => fold.id).join(",");
+    if (key === transcriptMirror.planKey) return;
+    const plan = folds.map((fold) => {
+      const row = foldIndexRow(fold, state!, snapshot!);
+      return {
+        id: fold.id,
+        kind: String(row.kind ?? ""),
+        brief: String(row.brief ?? ""),
+        sourceCount: Number(row.sourceCount ?? 0),
+        entryIds: flattenFoldRefs(fold, state!).map((ref) => ref.entryId),
+      };
+    });
+    transcriptMirror.plan = plan;
+    transcriptMirror.planKey = key;
+  };
+  const syncTranscript = (): void => {
+    const mirror = transcriptMirror;
+    if (!mirror.tui || !mirror.ctx) return;
+    try {
+      mirror.chat ??= locateChatContainer(mirror.tui);
+      const chat = mirror.chat;
+      if (!chat) return;
+      if (chat.children === mirror.applied && mirror.planKey === mirror.appliedKey) return;
+      // Settle the attempt BEFORE making it: a failure is retried when something moves,
+      // never on every frame.
+      mirror.appliedKey = mirror.planKey;
+      mirror.applied = chat.children;
+      const theme = () => mirror.ctx?.ui?.theme;
+      const next = foldedChildren(chat.children, mirror.ctx.sessionManager.getBranch(), mirror.plan,
+        (text) => { try { return theme()?.fg?.("muted", text) ?? text; } catch { return text; } });
+      chat.children = next;
+      mirror.applied = next;
+      foldBar.requestRender?.();
+    } catch { }
+  };
+  const restoreTranscript = (): void => {
+    const chat = transcriptMirror.chat;
+    try { if (chat) chat.children = unfoldedChildren(chat.children); } catch { }
+    Object.assign(transcriptMirror, { chat: null, ctx: null, plan: [], planKey: "",
+      applied: null, appliedKey: "" });
+  };
   // DISPLAY ONLY. Pi owns the live reading, including its unmeasured trailing messages
   // and post-compaction unknown state. Never substitute our saved provider measurement
   // or projection estimate. The band remains a share of the SERVING budget: convert its
@@ -814,12 +886,14 @@ export function registerActiveContext(pi: any, options: {
     foldBar.installed = true;
     ctx.ui.setWidget(entryTypePrefix, (tui: any) => {
       foldBar.requestRender = () => { try { tui.requestRender(); } catch { } };
+      transcriptMirror.tui = tui;
       return {
         /** The model behind the row, for the lab and the gates. */
         get model(): FoldBarModel | null {
           return foldBar.model ? { ...foldBar.model, ...foldBarUsage(ctx) } : null;
         },
         render(width: number): string[] {
+          syncTranscript();
           const model = this.model;
           if (!model) return [];
           try { return [renderFoldBar(model, width, ctx.ui.theme)]; }
@@ -934,6 +1008,7 @@ export function registerActiveContext(pi: any, options: {
             weighed: ladder.bandTopMeasurement !== null &&
               ladder.bandTopMeasurement === measurements.lastProviderMeasurement,
           });
+          planTranscript(ctx);
           foldBar.requestRender?.();
         }
       } catch { }
@@ -5098,6 +5173,7 @@ export function registerActiveContext(pi: any, options: {
     try { ctx.ui?.setStatus?.(entryTypePrefix, undefined); } catch { }
     foldBar.model = null;
     foldBar.startupSnapshot = null;
+    restoreTranscript();
     foldBar.requestRender?.();
   });
 

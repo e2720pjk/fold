@@ -18499,6 +18499,178 @@ async function gateFoldBarUsesPiContextUsage() {
     netCommitShare: netWidget.model.commitShare, hostReads: reads };
 }
 
+/** GATE 178: The chat mirrors the model's window.
+ * Pi paints raw entries and only a native compaction ever clears its chat, which pi-fold
+ * cancels, so a long session's chat grew without bound. Each fold the model holds
+ * collapsed is ONE row with Pi's own components held behind it, re-folded when the
+ * model's folds or Pi's paint change and never per frame; an expansion and a shutdown
+ * hand the same objects back in place. Real Pi component classes, real runtime.
+ */
+async function gateTranscriptMirrorsModelWindow() {
+  const sdk = await import("@earendil-works/pi-coding-agent");
+  const { Container, Spacer, Text, visibleWidth } = await import("@earendil-works/pi-tui");
+  sdk.initTheme(undefined, false);
+  const built = makeFixture({ turns: 8, resultChars: 2_000, contextWindow: 1_000_000,
+    thresholds: TINY_FOLD_FLOOR, sessionId: "transcript-mirror" });
+  built.snapshot = context.mapActiveContext({ sessionId: built.sessionId, eventMessages: built.messages,
+    contextEntries: built.entries, contextWindow: 1_000_000, thresholds: TINY_FOLD_FLOOR });
+  let state = context.emptyActiveContextState(built.sessionId);
+  const foldedTurns = [1, 2, 4];
+  for (const turn of foldedTurns) {
+    const ids = [built.turnEntries[turn][0], built.turnEntries[turn].at(-1)];
+    state = (await commitCandidate(state, built.snapshot, context.manualFoldCandidate(built.snapshot, state, ids), {
+      brief: `Turn ${turn} read its file and reported.`, now: turn + 1,
+    })).state;
+  }
+  const thresholds = { maxTarget: 0.80, minTarget: 0.20, consolidateAfter: 10, minFoldChars: 1_000_000 };
+  const runtime = makeRuntime(built, { thresholds, initialEntries: [
+    ...built.entries, stateEntry(built.sessionId, state, "mirror-state", built.entries.at(-1).id),
+  ] });
+  runtime.ctx.sessionManager.buildSessionContext = () => ({ messages: runtime.branch.flatMap(context.sessionEntryMessages) });
+  let branchReads = 0;
+  const getBranch = runtime.ctx.sessionManager.getBranch;
+  runtime.ctx.sessionManager.getBranch = () => { branchReads += 1; return getBranch(); };
+
+  // Paint the chat the way Pi's renderSessionItems does, recording which entry owns each
+  // component: a spacer leads the user message after it, a notice trails its assistant.
+  const owner = new Map();
+  const chat = new Container();
+  const paint = () => {
+    chat.clear();
+    for (const entry of runtime.branch) {
+      const message = entry.type === "message" ? entry.message : null;
+      if (message?.role === "user") {
+        const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+        if (chat.children.length) { const spacer = new Spacer(1); owner.set(spacer, entry.id); chat.addChild(spacer); }
+        const user = new sdk.UserMessageComponent(text);
+        owner.set(user, entry.id);
+        chat.addChild(user);
+      } else if (message?.role === "assistant") {
+        const assistant = new sdk.AssistantMessageComponent(message);
+        owner.set(assistant, entry.id);
+        chat.addChild(assistant);
+        for (const part of message.content.filter((item) => item.type === "toolCall")) {
+          const tool = new sdk.ToolExecutionComponent(part.name, part.id, part.arguments, {}, undefined,
+            { requestRender() {} }, process.cwd());
+          owner.set(tool, entry.id);
+          chat.addChild(tool);
+        }
+        const notice = new Text("Cache miss: 20k tokens re-billed", 1, 0);
+        owner.set(notice, entry.id);
+        chat.addChild(notice);
+      }
+    }
+    return [...chat.children];
+  };
+  const header = new Container();
+  header.addChild(new Text("pi", 0, 0));
+  const document = new Container();
+  document.addChild(header);
+  document.addChild(new Container());
+  document.addChild(chat);
+  const pending = new Container();
+  pending.addChild(new Text("queued: steer", 1, 0));
+  let renders = 0;
+  const tui = { children: [document, pending], requestRender() { renders += 1; } };
+  let widget;
+  runtime.ctx.ui.theme = { fg: (_c, text) => text, bold: (text) => text };
+  runtime.ctx.ui.setWidget = (_key, factory) => { widget = factory(tui, runtime.ctx.ui.theme); };
+  let painted = paint();
+  await startRuntime(runtime);
+  await measure(runtime, 200_000, 1_000_000);
+  await project(runtime);
+  await settle();
+  painted = paint();
+
+  const foldEntries = new Map(materialized(runtime).folds.map((fold) =>
+    [fold.id, new Set(context.flattenFoldRefs(fold, materialized(runtime)).map((ref) => ref.entryId))]));
+  assert.equal(foldEntries.size, 3, "the fixture owes three committed folds");
+  const isRow = (child) => typeof child?.foldId === "string" && Array.isArray(child.hidden);
+  const expectFolded = (visible, label) => {
+    const rows = chat.children.filter(isRow);
+    assert.deepEqual(rows.map((row) => row.foldId).sort(), [...visible].sort(), `${label}: wrong rows`);
+    const hiddenBy = new Map();
+    for (const id of visible) for (const entryId of foldEntries.get(id)) hiddenBy.set(entryId, id);
+    const expected = [];
+    const seen = new Set();
+    for (const component of painted) {
+      const fold = hiddenBy.get(owner.get(component));
+      if (!fold) { expected.push(component); continue; }
+      if (!seen.has(fold)) { seen.add(fold); expected.push(fold); }
+    }
+    assert.deepEqual(chat.children.map((child) => isRow(child) ? child.foldId : child), expected,
+      `${label}: the chat is not the model's window`);
+    for (const row of rows) {
+      assert.deepEqual(row.hidden, painted.filter((component) => hiddenBy.get(owner.get(component)) === row.foldId),
+        `${label}: a row does not hold exactly its own components, in order`);
+    }
+    return rows;
+  };
+
+  const work = () => ({ appended: runtime.appended.length, messages: runtime.messages.length,
+    steered: runtime.steered.length, state: materialized(runtime) });
+  let before = work();
+  widget.render(120);
+  const rows = expectFolded([...foldEntries.keys()], "first paint");
+  const rowText = rows[0].render(120).join("\n");
+  // The head the editor shows for the same fold: kind, a counted noun, the brief's first line.
+  assert(/^ ▸ chapter · 4 entries · User asked: Task \d/m.test(rowText), rowText);
+  assert(!rows.some((row) => row.render(120).join("").includes(row.foldId)), "a fold id reached the chat");
+  assert(rows[0].render(12).every((line) => visibleWidth(line) <= 12), "a row overflowed its width");
+  assert(renders > 0, "re-folding the chat did not ask for a frame");
+
+  // A frame is not a change: no branch walk, no new children array.
+  const folded = chat.children;
+  const reads = branchReads;
+  for (let frame = 0; frame < 25; frame += 1) widget.render(120);
+  assert.equal(chat.children, folded, "an unchanged frame rebuilt the chat");
+  assert.equal(branchReads, reads, "an unchanged frame walked the session");
+
+  // Pi appends live: the new component stays where Pi put it, nothing re-folds.
+  const live = new sdk.UserMessageComponent("a new prompt");
+  chat.addChild(live);
+  widget.render(120);
+  assert.equal(chat.children, folded);
+  assert.equal(chat.children.at(-1), live);
+  chat.removeChild(live);
+
+  // Pi repaints (resume, /tree, a settings change): fresh components, folded again.
+  painted = paint();
+  widget.render(120);
+  expectFolded([...foldEntries.keys()], "after Pi repainted");
+
+  assert.deepEqual(work(), before, "mirroring the chat performed runtime work");
+
+  // The model expands a fold: its components come back in place, as the same objects.
+  const target = [...foldEntries.keys()].find((id) => foldEntries.get(id).has(built.turnEntries[4][0]));
+  await toolCall(runtime, { action: "expand", id: target });
+  await project(runtime);
+  await settle();
+  assert(materialized(runtime).expanded.includes(target));
+  before = work();
+  widget.render(120);
+  expectFolded([...foldEntries.keys()].filter((id) => id !== target), "after the model expanded a fold");
+
+  // No chat container yet (a host whose chat holds no message): nothing breaks.
+  const lonely = makeRuntime(fixture178(built), { thresholds });
+  let lonelyWidget;
+  lonely.ctx.ui.theme = runtime.ctx.ui.theme;
+  lonely.ctx.ui.setWidget = (_key, factory) => { lonelyWidget = factory({ children: [new Container()], requestRender() {} }); };
+  await startRuntime(lonely);
+  assert(Array.isArray(lonelyWidget.render(120)));
+
+  assert.deepEqual(work(), before, "mirroring the chat performed runtime work");
+
+  // Shutdown hands every component back: the chat exactly as Pi painted it.
+  await runtime.handlers.get("session_shutdown")({}, runtime.ctx);
+  assert.deepEqual(chat.children, painted, "shutdown left the chat folded");
+  return { rows: rows.length, painted: painted.length, folded: folded.length };
+}
+
+function fixture178(built) {
+  return { ...built, entries: structuredClone(built.entries), messages: structuredClone(built.messages) };
+}
+
 async function gateHostPeersAndSdkSession() {
   const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
@@ -18746,6 +18918,7 @@ const gates = [
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],
   [177, "The fold bar uses Pi context usage on Pi's scale", gateFoldBarUsesPiContextUsage],
+  [178, "The chat mirrors the model's window", gateTranscriptMirrorsModelWindow],
   [140, "Fold settings round-trip through one validation path", gateFoldSettingsRoundTrip],
   [161, "A saved setting reaches the running session", gateSavedSettingsReachTheSession],
   [162, "A refused anchor is not an absent one", gateAnchorRefusalIsStated],

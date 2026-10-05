@@ -138,6 +138,8 @@ export const HARNESS_SOURCE = Object.freeze([
   "extensions/lib/selection.ts",
   "extensions/lib/tool-surface.ts",
   "extensions/lib/transcript.ts",
+  // The chat mirror (2026-10-04); imported by active-context.ts, so gate 113 applies.
+  "extensions/lib/transcript-mirror.ts",
 ]);
 
 // What a STEER run needs on top of the v4 list: its own worker and that worker's library.
