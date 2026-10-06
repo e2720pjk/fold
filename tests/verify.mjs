@@ -314,6 +314,7 @@ function makeRuntime(built, {
   preCommitNotice,
   noticeLeadShare,
   packageRegistration = false,
+  parentSession = null,
   sessionFile = join(tmpdir(), "pi-fold-test-session.jsonl"),
   // One injection point for a durable write that FAILS. Persistence is the only place
   // this runtime can lose a commit it has already computed, and a gate that cannot make
@@ -364,7 +365,7 @@ function makeRuntime(built, {
     // (extensions/lib/live-settings.ts): a gate that drives the settings screen against
     // this runtime has to register the screen on the same object the runtime was.
     pi,
-    built, handlers, tools, commands, appended, notifications, statuses, branch, messages,
+    built, handlers, tools, commands, appended, notifications, statuses, branch, messages, parentSession,
     steered, labels, abandoned,
     get usage() { return usage; },
     set usage(value) { usage = value; },
@@ -395,6 +396,7 @@ function makeRuntime(built, {
     },
     sessionManager: {
       getSessionId: () => built.sessionId,
+      getHeader: () => parentSession ? { parentSession } : { id: built.sessionId },
       getSessionFile: () => sessionFile,
       getBranch: () => branch,
       getEntries: () => branch,
@@ -472,7 +474,10 @@ async function settle(cycles = 4) {
 }
 
 async function startRuntime(runtime) {
-  await runtime.handlers.get("session_start")({}, runtime.ctx);
+  await runtime.handlers.get("session_start")(
+    { reason: runtime.parentSession ? "fork" : "startup" },
+    runtime.ctx,
+  );
   return runtime.handlers.get("context")({ messages: runtime.messages }, runtime.ctx);
 }
 
@@ -9215,9 +9220,10 @@ async function gateVanishedCommitAnnouncesItself() {
   //    143 folded 579,489 source chars, durable state never passed 134, none of its 11 folds
   //    reached a record, and occupancy ran past its budget with nothing reported.
   const source = readFileSync(new URL("../extensions/active-context.ts", import.meta.url), "utf8");
+  const noOpStart = source.indexOf("if (sameStateProjection(next, persistence.persisted)");
   const guard = source.slice(
-    source.indexOf("if (sameStateProjection(next, persistence.persisted))"),
-    source.indexOf("persistence.state = clone(persistence.persisted);"),
+    noOpStart,
+    source.indexOf("persistence.state = clone(persistence.persisted);", noOpStart),
   );
   assert(guard.length > 0, "The persistence no-op branch was not found where it is pinned");
   assert(/arrivingFoldIds\.length/.test(guard) && /throw new Error/.test(guard),
@@ -18089,6 +18095,315 @@ async function gateUnreadableLineageWritesNothing() {
 }
 
 /**
+ * GATE 181: FORKED STATE AND FOLD GRAPHS ARE REBASED; ANCESTOR RECORDS REPLAY SAFELY.
+ */
+async function verifyForkRebasesPendingState() {
+  const parentId = "fork-parent";
+  const childId = "fork-child";
+  const built = makeFixture({ sessionId: parentId, turns: 8, tools: false, chapterChars: 900 });
+  const ref = built.snapshot.branchObjects[0]?.ref;
+  assert(ref, "the parent fixture has no evidence refs to rebase");
+  let state = context.emptyActiveContextState(parentId);
+  const pendingMark = context.foldMarkFor({
+    candidate: { kind: "chapter", parts: [{ kind: "raw", ref }] },
+    brief: "A pending chapter mark must survive the fork.",
+    briefProvenance: { kind: "deterministic" },
+    origin: "agent",
+    ordinal: 1,
+  });
+  state = context.withPendingMarks(state, [pendingMark]);
+  state.revision = 3;
+  state.protected = [ref];
+  const parentState = stateEntry(parentId, context.makeStateCheckpoint(state), "fork-parent-state");
+  const receipt = customEntry(context.PROVIDER_CONTEXT_MEASUREMENT_ENTRY, {
+    version: 1,
+    sessionId: parentId,
+    projectionRevision: state.revision,
+    messageSha256: "a".repeat(64),
+    provider: "openai-codex",
+    model: "gpt-test",
+    tokens: 1_000,
+    contextWindow: 100_000,
+    occurredAt: 1,
+  }, "fork-parent-measurement", parentState.id);
+  const parentEntries = [...built.entries, parentState, receipt];
+  const child = makeRuntime({ ...built, sessionId: childId }, {
+    initialEntries: parentEntries,
+    parentSession: "fork-parent.jsonl",
+  });
+  await startRuntime(child);
+
+  const rebased = materialized(child, childId);
+  assert.equal(rebased.pendingMarks?.length, 1, "the fork dropped its pending mark");
+  assert.equal(rebased.pendingMarks[0].parts[0].ref.sessionId, childId, "the pending mark kept the parent identity");
+  assert.equal(rebased.pendingMarks[0].id,
+    context.foldIdFor(rebased.pendingMarks[0].kind, rebased.pendingMarks[0].parts),
+    "the rebased mark kept a parent-derived id");
+  assert.equal(rebased.protected[0].sessionId, childId, "the protected ref kept the parent identity");
+  assert(child.appended.some((entry) => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY &&
+    entry.data.kind === "checkpoint" && entry.data.sessionId === childId),
+  "the fork did not persist a child-owned checkpoint");
+  assert(!child.notifications.some(({ message }) =>
+    /Active-context state could not be read|Malformed provider measurement receipt/.test(message)),
+  "valid inherited records still produced restore warnings");
+  assert.equal(parentState.data.sessionId, parentId, "rebasing mutated the parent record");
+  assert.equal(receipt.data.sessionId, parentId, "receipt handling mutated the parent record");
+
+  // A /tree restore reaches this path without a session_start reason; the parent header
+  // alone must still identify the inherited branch and trigger a child-owned checkpoint.
+  const treeChildId = `${childId}-tree`;
+  const treeChild = makeRuntime({ ...built, sessionId: treeChildId }, {
+    initialEntries: parentEntries,
+    parentSession: "fork-parent.jsonl",
+  });
+  await treeChild.handlers.get("session_tree")({}, treeChild.ctx);
+  const treeRebased = materialized(treeChild, treeChildId);
+  assert.equal(treeRebased.pendingMarks?.[0]?.parts[0]?.ref.sessionId, treeChildId,
+    "session_tree did not rebase the inherited pending mark from the parent header");
+  assert(treeChild.appended.some((entry) => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY &&
+    entry.data.kind === "checkpoint" && entry.data.sessionId === treeChildId),
+  "session_tree did not persist a child-owned checkpoint");
+  assert(!contextEvents(treeChild).some((event) => event.kind === "context.suspend"),
+    "session_tree suspended a valid fork");
+  return { rebasedPendingMarks: rebased.pendingMarks.length, childCheckpoint: true, treeSessionLoaded: true };
+}
+
+async function verifyForkRebasesFoldGraph({
+  withContentDrift = false, withSystemMessages = false, legacySystemRefs = false,
+} = {}) {
+  const folded = await smallChapterForest(2);
+  const childFolds = [...folded.state.folds];
+  const consolidation = await commitCandidate(folded.state, folded.snapshot, {
+    kind: "consolidation",
+    parts: childFolds.map((fold) => ({ kind: "fold", foldId: fold.id })),
+    sourceRefs: childFolds.flatMap((fold) => context.flattenFoldRefs(fold, folded.state)),
+  }, { brief: "A nested parent preserves its independently recoverable chapters.", now: 3 });
+  folded.state = consolidation.state;
+  let parentFold = folded.state.folds.find((fold) => fold.kind === "consolidation");
+  for (let level = 0; level < 3; level++) {
+    const parts = [{ kind: "fold", foldId: parentFold.id }];
+    parentFold = { ...parentFold, id: context.foldIdFor("consolidation", parts), parentId: null, parts };
+    folded.state.folds = persistenceModule.deriveFoldParents([...folded.state.folds, parentFold]);
+  }
+  if (withSystemMessages) {
+    const system = { type: "message", id: "fork-system", parentId: null, timestamp: 0,
+      message: { role: "system", sections: [{ text: "Pi system instructions", path: "AGENTS.md", countTokens: false }], timestamp: 0 } };
+    folded.entries[0].parentId = system.id;
+    folded.entries.unshift(system);
+    folded.messages = folded.entries.flatMap(context.sessionEntryMessages).filter((message) => message.role !== "system");
+    if (legacySystemRefs) {
+      const snapshot = context.mapActiveContext({
+        sessionId: folded.sessionId, eventMessages: folded.messages, contextEntries: folded.entries,
+      });
+      const systemRef = snapshot.branchObjects.find((item) => item.ref?.entryId === system.id)?.ref;
+      assert(systemRef, "the legacy system ref must still exist as branch evidence");
+      const sourceRefs = [systemRef, ...context.flattenFoldRefs(parentFold, folded.state)];
+      const oldParentId = parentFold.id;
+      const parts = [{ kind: "raw", ref: systemRef }, ...parentFold.parts];
+      parentFold = { ...parentFold, parts, id: context.foldIdFor("consolidation", parts),
+        sourceSha256: json.sha256Value(sourceRefs), sourceChars: parentFold.sourceChars + JSON.stringify(system.message).length };
+      folded.state.folds = persistenceModule.deriveFoldParents(folded.state.folds.map((fold) =>
+        fold.id === oldParentId ? parentFold : fold));
+    }
+  }
+  let driftedRef = null;
+  if (withContentDrift) {
+    driftedRef = context.flattenFoldRefs(folded.state.folds[0], folded.state)
+      .find((ref) => ref.role === "assistant");
+    assert(driftedRef, "the drift probe needs a folded assistant entry");
+    folded.entries.find((entry) => entry.id === driftedRef.entryId).message.diagnostics = [{ type: "persisted-only" }];
+    folded.messages = folded.entries.flatMap(context.sessionEntryMessages).filter((message) => message.role !== "system");
+  }
+  const foldedParentId = folded.sessionId;
+  const foldedChildId = `${foldedParentId}-fork`;
+  const originalFoldId = parentFold.id;
+  const originalRawRef = context.flattenFoldRefs(
+    folded.state.folds.find((fold) => fold.id === originalFoldId), folded.state,
+  )[0];
+  folded.state.expanded = [originalFoldId];
+  folded.state.protected = [originalRawRef];
+  folded.state.leases = { [originalFoldId]: 1 };
+  folded.state.briefs = { [originalFoldId]: "This child-owned override survives the fork." };
+  folded.state.pendingMarks = [{ mark: "refold", id: originalFoldId, origin: "agent", ordinal: 1 }];
+  folded.state.revision += 1;
+  folded.state = persistenceModule.parseActiveContextState(folded.state, foldedParentId);
+  let parentTail = folded.entries.at(-1)?.id ?? null;
+  const records = folded.state.folds.map((fold, index) => {
+    const entry = customEntry(
+      context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY,
+      persistenceModule.makeFoldRecordEntry(fold, foldedParentId),
+      `fork-parent-fold-${index}`,
+      parentTail,
+    );
+    parentTail = entry.id;
+    return entry;
+  });
+  const foldedState = stateEntry(
+    foldedParentId,
+    context.makeStateCheckpoint(folded.state),
+    "fork-parent-folded-state",
+    parentTail,
+  );
+  const foldedChild = makeRuntime({ ...folded, sessionId: foldedChildId }, {
+    initialEntries: [...folded.entries, ...records, foldedState],
+    parentSession: "forked-folded-parent.jsonl",
+  });
+  if (withSystemMessages) {
+    await foldedChild.handlers.get("session_start")({ reason: "fork" }, foldedChild.ctx);
+    const beforeContext = await compactBoundary(foldedChild);
+    assert.equal(beforeContext?.cancel, true, "a fork must block native compaction before its first context event");
+    const projection = await project(foldedChild);
+    assert(!projection.messages.some((message) => message.role === "system"),
+      "the fork projected Pi's system messages into the model window");
+  } else {
+    await startRuntime(foldedChild);
+  }
+  assert(foldedChild.appended.some((entry) => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY &&
+    entry.data.sessionId === foldedChildId), `folded fork did not persist: ${JSON.stringify(foldedChild.notifications)}`);
+  const childOwnedEntries = foldedChild.branch.filter((entry) =>
+    entry.customType !== context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY || entry.data.sessionId === foldedChildId);
+  const rebasedFolds = context.materializeActiveContextState(childOwnedEntries, foldedChildId);
+  assert.equal(rebasedFolds.folds.length, folded.state.folds.length, "the fork dropped committed folds");
+  assert.notEqual(rebasedFolds.folds[0].id, folded.state.folds[0].id, "the committed fold kept its parent-derived id");
+  assert(rebasedFolds.folds.every((fold) => context.flattenFoldRefs(fold, rebasedFolds)
+    .every((item) => item.sessionId === foldedChildId)), "a migrated fold retained parent evidence refs");
+  for (let index = 0; index < folded.state.folds.length; index++) {
+    const originalRefs = context.flattenFoldRefs(folded.state.folds[index], folded.state);
+    const expectedRefs = originalRefs.map((ref) => ({ ...ref, sessionId: foldedChildId }));
+    const actualRefs = context.flattenFoldRefs(rebasedFolds.folds[index], rebasedFolds);
+    assert.deepEqual(actualRefs, expectedRefs, "rebasing changed nested source order or content");
+    assert.equal(rebasedFolds.folds[index].sourceSha256, json.sha256Value(expectedRefs),
+      "rebasing changed the nested source digest");
+  }
+  const rebasedParent = rebasedFolds.folds.find((fold) => fold.kind === "consolidation" && fold.parentId === null);
+  assert(rebasedParent, "the nested consolidation fold was not migrated");
+  assert.deepEqual(rebasedFolds.expanded, [rebasedParent.id], "expanded state was not re-keyed");
+  assert.equal(rebasedFolds.leases[rebasedParent.id], 1, "expand lease was not re-keyed");
+  assert.equal(rebasedFolds.briefs[rebasedParent.id],
+    "This child-owned override survives the fork.", "fold brief override was not re-keyed");
+  assert.equal(rebasedFolds.pendingMarks[0].id, rebasedParent.id, "refold mark was not re-keyed");
+  assert(rebasedFolds.protected.every((item) => item.sessionId === foldedChildId),
+    "protected evidence retained its parent identity");
+  assert(foldedChild.appended.some((entry) => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY &&
+    entry.data.kind === "checkpoint" && entry.data.sessionId === foldedChildId),
+  "the folded fork did not persist a child-owned checkpoint");
+  assert.equal(foldedChild.appended.filter((entry) =>
+    entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY && entry.data.sessionId === foldedChildId).length,
+  rebasedFolds.folds.length, "the fork did not persist child-owned fold records");
+  assert(!contextEvents(foldedChild).some((event) => event.kind === "context.suspend"),
+    "a valid folded fork suspended automatic folding");
+  if (withSystemMessages) {
+    const snapshot = context.mapActiveContext({
+      sessionId: foldedChildId, eventMessages: foldedChild.messages, contextEntries: foldedChild.branch,
+    });
+    assert.equal(context.orderedRoots(rebasedFolds, snapshot).length, 1,
+      "a system entry orphaned the inherited fold subtree");
+  }
+  if (withContentDrift) {
+    await project(foldedChild);
+    await project(foldedChild);
+    const snapshot = context.mapActiveContext({
+      sessionId: foldedChildId,
+      eventMessages: foldedChild.messages,
+      contextEntries: foldedChild.branch,
+    });
+    assert.equal(context.orderedRoots(rebasedFolds, snapshot).length, 1,
+      "content drift orphaned the inherited root after the fork");
+    const drift = contextEvents(foldedChild).filter((event) =>
+      event.kind === "context.drift" && event.entry_ids?.includes(driftedRef.entryId));
+    assert.equal(drift.length, 1, "the fork must retain and report a drifted source digest once");
+  }
+
+  const reloadedChild = makeRuntime({ ...folded, sessionId: foldedChildId }, {
+    initialEntries: foldedChild.branch,
+    parentSession: "forked-folded-parent.jsonl",
+  });
+  await startRuntime(reloadedChild);
+  assert(!contextEvents(reloadedChild).some((event) => event.kind === "context.suspend"),
+    "reloading the rebased fork rejected inherited ancestor fold records");
+  assert.equal(reloadedChild.appended.filter((entry) =>
+    entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY ||
+    entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY).length, 0,
+  "reloading a valid rebased fork wrote duplicate state");
+
+  return { rebasedFolds: rebasedFolds.folds.length, reloadStateWrites: 0, contentDriftRecorded: withContentDrift,
+    systemMessagesExcluded: withSystemMessages, legacySystemRefsRetained: legacySystemRefs };
+}
+
+async function assertForkRestoreRejected(built, state, expectedError, { missingMessages = false } = {}) {
+  const childId = `${built.sessionId}-invalid-fork`;
+  let tail = built.entries.at(-1)?.id ?? null;
+  const records = state.folds.map((fold, index) => {
+    const entry = customEntry(context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY,
+      persistenceModule.makeFoldRecordEntry(fold, built.sessionId), `invalid-parent-fold-${index}`, tail);
+    tail = entry.id;
+    return entry;
+  });
+  const checkpoint = stateEntry(built.sessionId, context.makeStateCheckpoint(state), "invalid-parent-state", tail);
+  const child = makeRuntime({ ...built, sessionId: childId }, {
+    initialEntries: [...built.entries, ...records, checkpoint],
+    parentSession: "invalid-parent.jsonl",
+  });
+  if (missingMessages) child.ctx.sessionManager.buildSessionContext = () => ({ messages: null });
+  await startRuntime(child);
+  assert(child.notifications.some(({ message }) => message.endsWith(`Error: ${expectedError}`)),
+    `fork restore did not report ${expectedError}: ${JSON.stringify(child.notifications)}`);
+  assert(contextEvents(child).some((event) => event.kind === "context.suspend"),
+    "an invalid inherited fork did not suspend folding");
+  assert.equal(child.appended.filter((entry) => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY ||
+    entry.customType === context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY).length, 0,
+  "an invalid inherited fork wrote child-owned state");
+}
+
+async function verifyForkRejectsInvalidState() {
+  const built = makeFixture({ sessionId: "invalid-fork-parent", turns: 8, tools: false, chapterChars: 900 });
+  const ref = built.snapshot.branchObjects[0].ref;
+  const protectedState = (protectedRef) => ({ ...context.emptyActiveContextState(built.sessionId), protected: [protectedRef] });
+  const missingRef = { ...ref, entryId: "absent-entry" };
+  await assertForkRestoreRejected(built, protectedState(missingRef),
+    "Inherited active-context evidence absent-entry is missing or ambiguous in the fork branch");
+  await assertForkRestoreRejected(built, protectedState({ ...ref, role: "toolResult" }),
+    `Inherited active-context evidence ${ref.entryId} is missing or ambiguous in the fork branch`);
+  await assertForkRestoreRejected(built, protectedState(ref),
+    "Pi did not provide the fork branch messages needed to rebase active-context state", { missingMessages: true });
+
+  const folded = await smallChapterForest(1);
+  const source = folded.state.folds[0];
+  const parts = source.parts.map((part) => ({ ...part, ref: { ...part.ref, sessionId: "distinct-ancestor" } }));
+  const alternate = { ...source, id: context.foldIdFor(source.kind, parts), parts,
+    sourceSha256: json.sha256Value(parts.map((part) => part.ref)) };
+  const collisionState = persistenceModule.parseActiveContextState({
+    ...folded.state, folds: [source, alternate],
+  }, folded.sessionId);
+  await assertForkRestoreRejected(folded, collisionState, "Invalid active-context fold");
+  // The forest error must still win when curation rebasing also fails.
+  await assertForkRestoreRejected(folded, { ...collisionState, protected: [missingRef] }, "Invalid active-context fold");
+  return 5;
+}
+
+async function gateForkRebasesInheritedState() {
+  const pending = await verifyForkRebasesPendingState();
+  const folded = await verifyForkRebasesFoldGraph();
+  const drifted = await verifyForkRebasesFoldGraph({ withContentDrift: true });
+  const system = await verifyForkRebasesFoldGraph({ withSystemMessages: true });
+  const legacy = await verifyForkRebasesFoldGraph({ withSystemMessages: true, legacySystemRefs: true });
+  const mixed = await verifyForkRebasesFoldGraph({ withSystemMessages: true, legacySystemRefs: true, withContentDrift: true });
+  const rejectedInvalidForks = await verifyForkRejectsInvalidState();
+  return {
+    rebasedPendingMarks: pending.rebasedPendingMarks,
+    rebasedFolds: folded.rebasedFolds,
+    childCheckpoint: pending.childCheckpoint,
+    treeSessionLoaded: pending.treeSessionLoaded,
+    forkContentDriftRecorded: drifted.contentDriftRecorded,
+    forkSystemMessagesExcluded: system.systemMessagesExcluded,
+    legacySystemRefsRetained: legacy.legacySystemRefsRetained,
+    systemAndContentDriftSurvive: mixed.systemMessagesExcluded && mixed.contentDriftRecorded,
+    reloadStateWrites: folded.reloadStateWrites,
+    rejectedInvalidForks,
+  };
+}
+
+/**
  * GATE 174 (2026-09-20). A BOUNDED DELTA RUN KEEPS THE REPLAY BOUNDED.
  *
  * The v2 ledger was one checkpoint and then deltas for the life of the session, and every
@@ -18914,7 +19229,9 @@ async function gateHostPeersAndSdkSession() {
     await session.prompt("Recover the exact folded source.");
     const peek = manager.getBranch().find((entry) => entry.type === "message" &&
       entry.message.role === "toolResult" && entry.message.toolCallId === "sdk-exact-peek");
-    assert(peek && !peek.message.isError, "Pi failed to dispatch the fold tool");
+    assert(peek && !peek.message.isError,
+      `Pi failed to dispatch the fold tool: ${JSON.stringify({ peek, errors, queuedReplies: replies.length,
+        frames: frames.length, lastMessageError: session.agent.state.messages.at(-1)?.errorMessage })}`);
     assert.equal(peek.message.details.source, exact.source);
     assert.equal(peek.message.details.truncated, false);
     assert(frames.some((frame) => JSON.stringify(frame).includes("[pi-fold active-context fold ")),
@@ -19065,6 +19382,7 @@ const gates = [
   // real boundaries on 2026-08-23 the band never opened once in a three-boundary
   // session, so the agent was never invited at all. The number stays spent.
   [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
+  [181, "A fork rebases inherited folds and pending state", gateForkRebasesInheritedState],
   [174, "A bounded delta run keeps the replay bounded", gateBoundedDeltaRun],
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],
