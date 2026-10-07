@@ -152,11 +152,11 @@ export function rollbackNoticeText(input: {
 }): string {
   const head = "The provider rejected the last request because the context exceeded its input limit. " +
     `${input.brandNoun} rolled the session back past that request (${input.entriesAbandoned} entry(s), ` +
-    `about ${input.tokensRolledBack} tokens, kept in the tree as an abandoned branch) and folded the ` +
-    "stale window to make room.";
+    `about ${input.tokensRolledBack} tokens, kept in the tree as an abandoned branch).`;
   if (input.replayed) {
-    return `${head} The request is being reissued now, so continue the work you were doing; nothing was lost, ` +
-      `and the folded material is still readable through ${input.toolName}.`;
+    return `${head} The request is being reissued now. Its context pass will attempt to fold eligible stale ` +
+      "material; the recovery receipt will report the result. Original entries remain in the session tree, " +
+      `and folded material is still readable through ${input.toolName}.`;
   }
   return `${head} The request was NOT reissued: ${input.replaySkipReason ?? "the rolled-back tail is not replayable"}. ` +
     "Reissue the work yourself from the state you can see.";

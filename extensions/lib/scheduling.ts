@@ -699,9 +699,12 @@ export function commitCoverage(input: {
   budgetTokens: number;
 }): CommitCoverage {
   const { snapshot, state, usedTokens, budgetTokens } = input;
-  const targetShare = usedTokens === null || !(budgetTokens > 0)
+  // Before the first response, or after a restore, an estimate can size a commit.
+  // It never decides whether the resulting request is allowed to reach the provider.
+  const occupancyTokens = usedTokens ?? estimatedTokens(pricedBytes(projectActiveContext(snapshot, state)));
+  const targetShare = !(budgetTokens > 0)
     ? 0
-    : Math.max(0, (usedTokens - snapshot.thresholds.minTarget * budgetTokens) / budgetTokens);
+    : Math.max(0, (occupancyTokens - snapshot.thresholds.minTarget * budgetTokens) / budgetTokens);
   const accounting = markAccounting(snapshot, state);
   const markedShare = accounting.eligibleFreedBudgetShare;
   const targetTokens = Math.round(targetShare * budgetTokens);

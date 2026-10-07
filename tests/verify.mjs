@@ -19254,6 +19254,326 @@ async function gateHostPeersAndSdkSession() {
   }
 }
 
+async function gateDiskSdkFork() {
+  const sdk = await import("@earendil-works/pi-coding-agent");
+  const directory = await mkdtemp(join(tmpdir(), "pi-fold-disk-fork-"));
+  const sessions = [];
+  try {
+    const modelRuntime = await sdk.ModelRuntime.create({
+      authPath: join(directory, "auth.json"), modelsPath: null,
+      modelsStorePath: join(directory, "models-store.json"),
+      allowModelNetwork: false, refreshOnCreate: false,
+    });
+    const model = modelRuntime.getModel("openai", "gpt-4o");
+    modelRuntime.streamSimple = () => { throw new Error("This fork exercise must make no provider call"); };
+    const settings = sdk.SettingsManager.inMemory({
+      compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { mode: "off" },
+    });
+    const bind = async (manager) => {
+      const loader = new sdk.DefaultResourceLoader({
+        cwd: directory, agentDir: directory, settingsManager: settings,
+        noExtensions: true, noSkills: true, noPromptTemplates: true,
+        noThemes: true, noContextFiles: true,
+        additionalExtensionPaths: [join(projectRoot, "extensions", "index.js")],
+      });
+      await loader.reload();
+      assert.deepEqual(loader.getExtensions().errors, []);
+      const { session } = await sdk.createAgentSession({
+        cwd: directory, agentDir: directory, modelRuntime, model, thinkingLevel: "off",
+        sessionManager: manager, settingsManager: settings, resourceLoader: loader,
+      });
+      sessions.push(session);
+      await session.bindExtensions({});
+      return session;
+    };
+    const built = await smallChapterForest(2);
+    const children = built.state.folds;
+    built.state = (await commitCandidate(built.state, built.snapshot, {
+      kind: "consolidation", parts: children.map(fold => ({ kind: "fold", foldId: fold.id })),
+      sourceRefs: children.flatMap(fold => context.flattenFoldRefs(fold, built.state)),
+    }, { brief: "Both complete chapters remain recoverable in this parent.", now: 3 })).state;
+    const root = built.state.folds.find(fold => fold.kind === "consolidation");
+    built.state.expanded = [root.id];
+    built.state.leases = { [root.id]: 1 };
+    built.state.briefs = { [root.id]: "A brief override survives a real disk fork." };
+    const ref = built.snapshot.branchObjects.at(-4).ref;
+    const candidate = { kind: "chapter", parts: [{ kind: "raw", ref }] };
+    built.state.pendingMarks = [context.foldMarkFor({ candidate,
+      brief: "A pending chapter survives a real disk fork.",
+      briefProvenance: { kind: "deterministic" }, origin: "agent", ordinal: 1 }),
+      { mark: "refold", id: root.id, origin: "agent", ordinal: 2 }];
+    built.state.protected = [ref];
+    built.state = context.parseActiveContextState(built.state, built.sessionId);
+    const path = join(directory, "parent.jsonl");
+    let tail = built.entries.at(-1).id;
+    const records = built.state.folds.map((fold, index) => {
+      const entry = customEntry(context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY,
+        context.makeFoldRecordEntry(fold, built.sessionId), `disk-fold-${index}`, tail);
+      tail = entry.id;
+      return entry;
+    });
+    const checkpoint = stateEntry(built.sessionId, context.makeStateCheckpoint(built.state), "disk-checkpoint", tail);
+    const receipt = customEntry(context.PROVIDER_CONTEXT_MEASUREMENT_ENTRY, {
+      version: 1, sessionId: built.sessionId, projectionRevision: built.state.revision,
+      messageSha256: "a".repeat(64), provider: model.provider, model: model.id,
+      tokens: 1_000, contextWindow: model.contextWindow, occurredAt: 1,
+    }, "disk-measurement", checkpoint.id);
+    await writeFile(path, [
+      { type: "session", version: 3, id: built.sessionId, timestamp: new Date().toISOString(), cwd: directory },
+      ...built.entries, ...records, checkpoint, receipt,
+    ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    const parent = sdk.SessionManager.open(path, directory);
+    await bind(parent);
+    const parentBytes = await readFile(path);
+    const child = sdk.SessionManager.open(path, directory);
+    child.createBranchedSession(child.getLeafId());
+    const childSession = await bind(child);
+    const childId = child.getSessionId();
+    assert.notEqual(childId, built.sessionId);
+    assert.equal(child.getHeader().parentSession, path);
+    const restored = context.materializeActiveContextState(child.getBranch().filter(entry => entry.customType !== context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY || entry.data.sessionId === childId), childId);
+    assert.equal(restored.folds.length, 3);
+    assert.equal(restored.pendingMarks.length, 2);
+    assert(restored.pendingMarks.filter(mark => mark.mark === "fold")
+      .every(mark => mark.parts.every(part => part.ref.sessionId === childId)));
+    assert(restored.folds.every(fold => context.flattenFoldRefs(fold, restored)
+      .every(ref => ref.sessionId === childId)));
+    assert.equal(restored.expanded.length, 1);
+    assert.equal(restored.leases[restored.expanded[0]], 1);
+    assert.equal(restored.briefs[restored.expanded[0]], built.state.briefs[root.id]);
+    const childRoot = restored.folds.find(fold => fold.kind === "consolidation");
+    const recovered = context.recoverFoldMessages({foldId: childRoot.id, state: restored,
+      entries: child.getBranch(), sessionId: childId});
+    const expected = context.recoverFoldMessages({foldId: root.id, state: built.state,
+      entries: built.entries, sessionId: built.sessionId});
+    assert.deepEqual(recovered, expected);
+    const stateWrites = () => child.getBranch().filter(entry => entry.type === "custom" &&
+      [context.ACTIVE_CONTEXT_STATE_ENTRY, context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY].includes(entry.customType)
+      && entry.data.sessionId === childId).length;
+    assert.equal(stateWrites(), 4);
+    await childSession.reload();
+    assert.equal(stateWrites(), 4, "a real reload duplicated the child checkpoint or folds");
+    const reopened = sdk.SessionManager.open(child.getSessionFile(), directory);
+    await bind(reopened);
+    const diskRestored = context.materializeActiveContextState(reopened.getBranch().filter(entry => entry.customType !== context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY || entry.data.sessionId === childId), childId);
+    assert.deepEqual(diskRestored, restored);
+    assert.deepEqual(await readFile(path), parentBytes, "fork or reload changed the parent's file");
+    assert(!reopened.getBranch().some(entry => entry.customType === "pi-fold-context-event" &&
+      entry.data.kind === "context.suspend"));
+    return { diskFork: true, folds: restored.folds.length, pendingMarks: restored.pendingMarks.length,
+      exactSource: true, parentFileUnchanged: true, childReloadWrites: 0, providerCalls: 0 };
+  } finally {
+    for (const session of sessions) session.dispose();
+    await rm(directory, {recursive: true, force: true});
+  }
+}
+
+// A valid ledger can still end behind a durable measurement. Detect the gap without
+// inventing missing deltas, then rebuild eligible folds from the surviving transcript.
+async function gateRestoreRevisionGap() {
+  const built = makeFixture({ sessionId: "restore-gap", turns: 40, tools: false,
+    chapterChars: 3_500, contextWindow: 100_000 });
+  const first = await commitCandidate(context.emptyActiveContextState(built.sessionId), built.snapshot,
+    context.manualFoldCandidate(built.snapshot, context.emptyActiveContextState(built.sessionId), built.turnEntries[0]),
+    { brief: "An already committed chapter must survive the ledger gap." });
+  const seed = context.parseActiveContextState({ ...first.state, revision: 3 }, built.sessionId);
+  const record = customEntry(context.ACTIVE_CONTEXT_FOLD_RECORD_ENTRY,
+    context.makeFoldRecordEntry(seed.folds[0], built.sessionId), "gap-fold");
+  const checkpoint = stateEntry(built.sessionId, context.makeStateCheckpoint(seed), "gap-checkpoint", record.id);
+  const receipt = (revision, owner = built.sessionId) => customEntry(context.PROVIDER_CONTEXT_MEASUREMENT_ENTRY, {
+    version: 1, sessionId: owner, projectionRevision: revision, messageSha256: "b".repeat(64),
+    provider: "openai-codex", model: "gpt-test", tokens: 1_000, contextWindow: 100_000, occurredAt: 1,
+  }, "gap-receipt", checkpoint.id);
+  const runtime = makeRuntime(built, { initialEntries: [...built.entries, record, checkpoint, receipt(8)] });
+  await runtime.handlers.get("session_start")({ reason: "startup" }, runtime.ctx);
+  assert(runtime.notifications.some(item => /revision 8.*restored.*revision 3/i.test(item.message)),
+    "a measurement ahead of the ledger was silently accepted");
+  assert.equal(materialized(runtime).revision, 3, "load invented the missing ledger revisions");
+  const original = structuredClone(runtime.messages);
+  const projection = await project(runtime);
+  await settle();
+  const commit = contextEvents(runtime).find(event => event.kind === "context.commit" &&
+    event.trigger === "restore-revision-gap" && event.applied_marks > 0);
+  assert(commit, "the restore gap did not rebuild fold candidates from surviving history");
+  assert.equal(commit.occupancy_tokens_before, null, "a missing projection's receipt was used as live occupancy");
+  assert(projection.messages.length < original.length);
+  assert.deepEqual(runtime.messages, original, "gap recovery changed raw source");
+  assert(!contextEvents(runtime).some(event => event.kind === "context.suspend"));
+  const state = materialized(runtime);
+  assert(state.folds.some(fold => fold.id === seed.folds[0].id && fold.sourceSha256 === seed.folds[0].sourceSha256),
+    "gap recovery discarded an existing fold");
+  for (const fold of state.folds.filter(item => item.parentId === null)) {
+    const recovered = context.recoverFoldMessages({ foldId: fold.id, state,
+      entries: runtime.branch, sessionId: built.sessionId });
+    assert(recovered.length > 0);
+    assert(recovered.every(message => original.some(item => json.stableStringify(item) === json.stableStringify(message))));
+  }
+  for (const revision of [2, 3]) {
+    const healthy = makeRuntime(built, { initialEntries: [...built.entries, record, checkpoint, receipt(revision)] });
+    await startRuntime(healthy);
+    assert(!healthy.notifications.some(item => /ahead|missing.*revision|revision.*restored/i.test(item.message)));
+  }
+  const fork = makeRuntime({ ...built, sessionId: "gap-child" }, {
+    initialEntries: [...built.entries, record, checkpoint, receipt(8)], parentSession: "gap-parent.jsonl",
+  });
+  await startRuntime(fork);
+  assert(!fork.notifications.some(item => /revision 8|Malformed provider/.test(item.message)),
+    "historical ancestor measurements were treated as a child ledger gap");
+  return { detected: true, reconstructed: state.folds.length, originalHistoryPreserved: true };
+}
+
+async function gateUnmeasuredRecoveryFill() {
+  const built = makeFixture({ sessionId: "unmeasured-fill", turns: 40, tools: false,
+    chapterChars: 3_500, contextWindow: 100_000 });
+  const state = context.emptyActiveContextState(built.sessionId);
+  const input = { snapshot: built.snapshot, state, usedTokens: null, budgetTokens: built.snapshot.budgetTokens };
+  const coverage = context.commitCoverage(input);
+  assert(coverage.targetShare > 0, "missing usage starved the commit fill");
+  assert.equal(context.commitCoverage({ ...input, usedTokens: 0 }).targetShare, 0,
+    "native zero was replaced by an estimate");
+  assert.equal(context.commitCoverage({ ...input, budgetTokens: 0 }).targetShare, 0);
+  const manual = makeRuntime(built);
+  await manual.handlers.get("session_start")({ reason: "startup" }, manual.ctx);
+  assert.equal(manual.appended.filter(entry => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY).length, 0);
+  const original = structuredClone(manual.messages);
+  await manual.commands.get("fold").handler("", manual.ctx);
+  assert(materialized(manual).folds.length > 0, "/fold before the first context event made no recovery candidates");
+  assert.deepEqual(manual.messages, original);
+  const automatic = makeRuntime(built);
+  await automatic.handlers.get("session_start")({ reason: "startup" }, automatic.ctx);
+  await project(automatic);
+  assert.equal(automatic.appended.filter(entry => entry.customType === context.ACTIVE_CONTEXT_STATE_ENTRY).length, 0,
+    "an unmeasured estimate triggered routine folding before the provider rejected it");
+  await overflow(automatic);
+  const projected = await project(automatic);
+  await settle();
+  assert(materialized(automatic).folds.length > 0, "an unmeasured provider-rejected request could not commit");
+  assert(projected.messages.length < automatic.messages.length);
+  assert.equal(automatic.aborts, 0);
+  const reloaded = makeRuntime(built, { initialEntries: manual.branch });
+  await startRuntime(reloaded);
+  assert.deepEqual(materialized(reloaded), materialized(manual), "unmeasured folds did not survive reload");
+  return { targetShare: coverage.targetShare, manualFolds: materialized(manual).folds.length,
+    automaticFolds: materialized(automatic).folds.length, aborts: 0 };
+}
+
+async function gateRecoveryReportingIsHonest() {
+  const notice = context.rollbackNoticeText({ brandNoun: "Acme", toolName: "acme_context",
+    tokensRolledBack: 100, entriesAbandoned: 1, replayed: true, replaySkipReason: null });
+  assert(!/folded the stale window|nothing was lost/.test(notice), "the pre-commit notice promises future success");
+  assert.match(notice, /receipt.*result/i);
+  const built = makeFixture({ sessionId: "recovery-report", turns: 8, tools: false,
+    chapterChars: 20_000, contextWindow: 34_000 });
+  const runtime = makeRuntime(built, { thresholds: { maxTarget: .8, minTarget: .2,
+    minFoldChars: 1_000_000, consolidateAfter: 10 } });
+  await startRuntime(runtime);
+  await project(runtime);
+  await overflow(runtime);
+  const after = await project(runtime);
+  await settle();
+  const receipt = contextEvents(runtime).filter(event => event.kind === "context.receipt" &&
+    event.receipt_kind === "overflow-recovery").at(-1);
+  assert(receipt && receipt.recovered === false, "the fixture did not reach failed recovery");
+  assert(!/run stops|not send|rather than sending/.test(receipt.note), "the returned request was described as stopped");
+  assert.match(receipt.note, /estimat/i);
+  assert(after.messages.length > 0);
+  assert.equal(runtime.aborts, 0);
+  for (const unavailable of ["missing", "throws"]) {
+    const failed = makeRuntime(built);
+    if (unavailable === "missing") delete failed.pi.sendMessage;
+    else failed.pi.sendMessage = () => { throw new Error("queue unavailable"); };
+    await startRuntime(failed);
+    await overflow(failed);
+    assert.match(failed.notifications.at(-1).message, /NOT reissued/);
+    assert(!/reissued now/.test(failed.notifications.at(-1).message));
+  }
+  return { pendingNotice: true, failedReceiptHonest: true, failedQueueHonest: true, aborts: 0 };
+}
+
+// With auto-compaction off, Pi has not stripped the error from agent state. Keep the
+// tree intact, report the lack of retry, and allow an explicit lossless /fold salvage.
+async function gateAutoCompactionOffRecovery() {
+  const sdk = await import("@earendil-works/pi-coding-agent");
+  const hostRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const hostAi = hostRequire.resolve.paths("@earendil-works/pi-ai")
+    .map(root => join(root, "@earendil-works", "pi-ai", "dist", "compat.js"))
+    .find(path => existsSync(path));
+  const { createAssistantMessageEventStream } = await import(pathToFileURL(hostAi));
+  const directory = await mkdtemp(join(tmpdir(), "pi-fold-autooff-"));
+  let session;
+  try {
+    const modelRuntime = await sdk.ModelRuntime.create({
+      authPath: join(directory, "auth.json"), modelsPath: null,
+      modelsStorePath: join(directory, "models-store.json"),
+      allowModelNetwork: false, refreshOnCreate: false,
+    });
+    const model = modelRuntime.getModel("openai", "gpt-4o");
+    await modelRuntime.setRuntimeApiKey(model.provider, "offline-fixture-not-a-provider-key");
+    const settings = sdk.SettingsManager.inMemory({
+      compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { mode: "off" },
+    });
+    const loader = new sdk.DefaultResourceLoader({
+      cwd: directory, agentDir: directory, settingsManager: settings,
+      noExtensions: true, noSkills: true, noPromptTemplates: true,
+      noThemes: true, noContextFiles: true,
+      additionalExtensionPaths: [join(projectRoot, "extensions", "index.js")],
+    });
+    await loader.reload();
+    const manager = sdk.SessionManager.create(directory, directory);
+    const built = makeFixture({ turns: 15, tools: false, chapterChars: 3_500 });
+    for (const message of built.messages) manager.appendMessage(message);
+    const sourceEntries = structuredClone(manager.getBranch());
+    const frames = [];
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+    modelRuntime.streamSimple = (_model, wire) => {
+      frames.push(structuredClone(wire));
+      const message = { role: "assistant", content: [], usage, provider: model.provider,
+        model: model.id, api: model.api, timestamp: Date.now(), stopReason: frames.length === 1 ? "error" : "stop",
+        ...(frames.length === 1 ? { errorMessage: "This model's maximum context length is 128000 tokens. However, your messages resulted in 150000 tokens." } : {}) };
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        if (message.stopReason === "error") stream.push({ type: "error", reason: "error", error: message });
+        else stream.push({ type: "done", reason: "stop", message });
+        stream.end();
+      });
+      return stream;
+    };
+    ({ session } = await sdk.createAgentSession({ cwd: directory, agentDir: directory,
+      modelRuntime, model, thinkingLevel: "off", sessionManager: manager,
+      settingsManager: settings, resourceLoader: loader }));
+    const errors = [];
+    await session.bindExtensions({ onError: error => errors.push(error) });
+    await session.prompt("Attempt this offline request.");
+    assert.equal(frames.length, 1, "auto-compaction off retried without an explicit request");
+    const failed = manager.getBranch().find(entry => entry.message?.stopReason === "error");
+    assert(failed, "the SDK fixture never reached a provider overflow");
+    const rollback = manager.getBranch().filter(entry => entry.customType === "pi-fold-context-event" &&
+      entry.data.kind === "context.rollback").at(-1)?.data;
+    assert(rollback && rollback.armed === false && rollback.replayed === false);
+    assert.match(rollback.disarm_reason, /auto-compaction is off/);
+    assert(!manager.getBranch().some(entry => entry.type === "compaction"));
+    await session.prompt("/fold");
+    const state = context.materializeActiveContextState(manager.getBranch(), manager.getSessionId());
+    assert(state.folds.length > 0, "the explicit auto-off salvage committed nothing");
+    for (const entry of sourceEntries) assert.deepEqual(manager.getEntry(entry.id), entry);
+    assert.deepEqual(manager.getEntry(failed.id), failed, "salvage removed an error the SDK had not stripped");
+    await session.prompt("Retry explicitly after the lossless fold.");
+    assert.equal(frames.length, 2);
+    assert(JSON.stringify(frames[1]).includes("[pi-fold active-context fold "));
+    assert(bytesOf(frames[1].messages) < bytesOf(frames[0].messages));
+    await session.reload();
+    const restored = context.materializeActiveContextState(manager.getBranch(), manager.getSessionId());
+    assert.deepEqual(restored, state);
+    assert.deepEqual(errors, []);
+    return { autoCompaction: false, automaticRetries: 0, explicitRetryFrames: 2,
+      losslessSalvageFolds: state.folds.length, reload: true, paidProviderCalls: 0 };
+  } finally {
+    session?.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 const gates = [
   [1, "Registration, parse and deployment branding", gateRegistrationAndBranding],
   [2, "The durable record: lattice, chain and rollback", gateDurableRecord],
@@ -19383,6 +19703,11 @@ const gates = [
   // session, so the agent was never invited at all. The number stays spent.
   [173, "An unreadable lineage writes nothing", gateUnreadableLineageWritesNothing],
   [181, "A fork rebases inherited folds and pending state", gateForkRebasesInheritedState],
+  [182, "On-disk SDK forks preserve parent and child state", gateDiskSdkFork],
+  [183, "Restore detects a receipt ahead of the ledger", gateRestoreRevisionGap],
+  [184, "Unmeasured recovery fills eligible stale context", gateUnmeasuredRecoveryFill],
+  [185, "Recovery reporting follows the actual outcome", gateRecoveryReportingIsHonest],
+  [186, "Auto-compaction off permits explicit lossless salvage", gateAutoCompactionOffRecovery],
   [174, "A bounded delta run keeps the replay bounded", gateBoundedDeltaRun],
   [175, "A fold is proven once per replay", gateFoldProvenOncePerReplay],
   [176, "Host peers fold, retrieve and reload in the real SDK", gateHostPeersAndSdkSession],

@@ -581,6 +581,7 @@ export function registerActiveContext(pi: any, options: {
     wallEpisodeOpen: false,
     recoveryAttempts: 0,
     pendingRejection: null as { status: number; ordinal: number } | null,
+    restoreRevisionGap: false,
     lastRecovery: null as Record<string, unknown> | null,
     instrumentationQueue: Promise.resolve<void>(undefined),
   };
@@ -1438,6 +1439,7 @@ export function registerActiveContext(pi: any, options: {
     curation.contextCalls = 0;
     curation.recoveryAttempts = 0;
     curation.pendingRejection = null;
+    curation.restoreRevisionGap = false;
     curation.lastRecovery = null;
     ladder.lastAutomaticAction = null;
     ladder.automaticFailure = null;
@@ -1453,6 +1455,7 @@ export function registerActiveContext(pi: any, options: {
     let measurementRestoreError: unknown = null;
     let forkBaseline = false;
     let startupSnapshot: ActiveContextSnapshot | null = null;
+    let aheadReceiptRevision: number | null = null;
     const branchEntries = [...ctx.sessionManager.getBranch()];
     const restoredMessages = piContextMessages(ctx);
     try {
@@ -1499,6 +1502,12 @@ export function registerActiveContext(pi: any, options: {
           throw new Error("One provider response has conflicting durable measurement receipts");
         }
         measurements.providerMeasurementByMessageSha.set(receipt.messageSha256, receipt);
+        if (restoreError === null && receipt.projectionRevision > (restored?.revision ?? 0)) {
+          aheadReceiptRevision = Math.max(aheadReceiptRevision ?? 0, receipt.projectionRevision);
+          // This receipt describes a projection whose state is absent from this branch.
+          // Keep the original receipt, but never anchor the restored window to it.
+          continue;
+        }
         const fingerprint = restoredPersistence?.projectionFingerprints.get(receipt.projectionRevision);
         if (fingerprint) {
           measurements.providerMeasurementAnchorByMessageSha.set(receipt.messageSha256, {
@@ -1517,6 +1526,12 @@ export function registerActiveContext(pi: any, options: {
       }
     }
     const durableRestored = restored ?? emptyActiveContextState(sessionId);
+    if (restoreError === null && aheadReceiptRevision !== null) {
+      curation.restoreRevisionGap = true;
+      safeNotify(ctx, `A provider receipt names revision ${aheadReceiptRevision}, ahead of the restored ` +
+        `${brandNoun} ledger at revision ${durableRestored.revision}. Existing folds and raw history are retained; ` +
+        "the next context pass will rebuild eligible folds from that history. Missing ledger changes cannot be replayed.", "warning");
+    }
     persistence.state = durableRestored.prepared ? clearPrepared(durableRestored) : clone(durableRestored);
     // AN UNREADABLE LINEAGE IS NOT AN EMPTY ONE (2026-09-07). `persistedWireVersion` reads
     // 0 for both, and `persist` writes a CHECKPOINT whenever it is not 2, so a restore that
@@ -2638,7 +2653,8 @@ export function registerActiveContext(pi: any, options: {
         recovered,
         note: measured.over
           ? `The rebuilt request is still ${measured.tokens} tokens against a ${measured.budgetTokens}-token ` +
-            "serving budget, so the run stops here rather than sending a request the provider will reject again."
+            "serving budget by our estimate. Available folds have been attempted; the retry is being sent, " +
+            "and the provider will determine whether it fits. Recovery is not yet established."
           : recovered
             ? "A rollback was required: the provider rejected the last request, which overfilled the serving " +
               `budget at ${rejectedTokens} estimated tokens against ${measured.budgetTokens}. This pass ` +
@@ -3015,7 +3031,7 @@ export function registerActiveContext(pi: any, options: {
       if (addition.added) { state = addition.state; consolidationAdded += 1; }
     }
     const capacity = servingCapacity(snapshot.contextWindow);
-    const usedTokens = capacity.usedTokens;
+    const usedTokens = curation.restoreRevisionGap ? null : capacity.usedTokens;
     const budgetTokens = capacity.budgetTokens;
     const overflowExempt = userRequested || curation.recoveryAttempts > 0 ||
       (usedTokens !== null && budgetTokens > 0 && usedTokens > budgetTokens);
@@ -3403,8 +3419,10 @@ export function registerActiveContext(pi: any, options: {
     phase: string,
     operation: () => Promise<Record<string, unknown> | null>,
   ): Promise<Record<string, unknown> | null> => {
-    if (!persistence.state || !measurements.lastProviderMeasurement ||
-        !durableProviderMeasurementMatches(measurements.lastProviderMeasurement)) return null;
+    const unmeasuredRecovery = phase === "restore-revision-gap" ||
+      (phase === "projection-budget" && curation.pendingRejection !== null && !measurements.lastProviderMeasurement);
+    if (!persistence.state || (!unmeasuredRecovery && (!measurements.lastProviderMeasurement ||
+        !durableProviderMeasurementMatches(measurements.lastProviderMeasurement)))) return null;
     if (ladder.automaticFailure) {
       ladder.automaticFailure.suppressedCallbacks = Math.min(
         Number.MAX_SAFE_INTEGER,
@@ -3687,6 +3705,15 @@ export function registerActiveContext(pi: any, options: {
       // neither of their inputs. What it changes is WHEN the agent learns a fold exists,
       // which is now while the material it covers is still in front of it.
       advanceFoldFrontier(snapshot);
+      if (curation.restoreRevisionGap && !ladder.automaticFailure) {
+        mutationAttempted = true;
+        const action = await attemptAutomaticCommit(snapshot, ctx, "restore-revision-gap", 1);
+        if (action) {
+          persistedSucceeded = true;
+          projected = projectWithAdvisory(snapshot);
+        }
+        curation.restoreRevisionGap = false;
+      }
       // BEFORE the fence, so an ordinary crossing is an ordinary commit and the fence is
       // left holding only the requests that genuinely will not fit.
       if (await enforceBandTop(snapshot, ctx)) {
@@ -3939,7 +3966,8 @@ export function registerActiveContext(pi: any, options: {
     rollback.attempts += 1;
     refuseRollback(
       "the overflow arrived without a compaction event, so pi never stripped the failed message from agent " +
-      "state and a tree rollback would leave the tree and agent state disagreeing (auto-compaction is off)",
+      "state and a tree rollback would leave the tree and agent state disagreeing (auto-compaction is off); " +
+      `use /${commandNames.fold} to commit eligible stale context, then retry explicitly`,
       "message_end",
       ctx,
     );
@@ -4007,7 +4035,7 @@ export function registerActiveContext(pi: any, options: {
         "turn after an unsatisfied tool call is a malformed transcript for every provider";
     }
     const occupancyBefore = measurements.lastProviderMeasurement?.tokens ?? null;
-    const notice = rollbackNoticeText({
+    let notice = rollbackNoticeText({
       brandNoun,
       toolName,
       tokensRolledBack: estimatedTokens(rolledBackBytes),
@@ -4031,7 +4059,13 @@ export function registerActiveContext(pi: any, options: {
         }
       }
     }
-    if (!replayed) safeNotify(ctx, notice, "warning");
+    if (!replayed) {
+      notice = rollbackNoticeText({
+        brandNoun, toolName, tokensRolledBack: estimatedTokens(rolledBackBytes),
+        entriesAbandoned: abandoned.length, replayed: false, replaySkipReason,
+      });
+      safeNotify(ctx, notice, "warning");
+    }
     const record = emit("context.rollback", {
       trigger: "session_before_compact",
       armed: true,
@@ -5018,14 +5052,19 @@ export function registerActiveContext(pi: any, options: {
         const occupancy = capacity.usedTokens !== null && capacity.budgetTokens > 0
           ? capacity.usedTokens / capacity.budgetTokens
           : null;
-        const topUp = occupancy !== null && occupancy >= thresholds.maxTarget;
+        const estimatedOccupancy = occupancy ?? (capacity.budgetTokens > 0
+          ? estimatedTokens(pricedBytes(projectActiveContext(snapshot, persistence.state!))) / capacity.budgetTokens
+          : 0);
+        const topUp = Boolean(curation.restoreRevisionGap) || estimatedOccupancy >= thresholds.maxTarget;
         const committed = await runCommitEpoch(snapshot, "user-command", topUp, measurements.latestRatio, true);
         // Until this lands the epoch's folds are in the event stream and nowhere else.
         // Swallowing the failure here announced a commit that does not exist and left the
         // session computing folds it would keep throwing away, which is the dead session
         // gate 122 was built for, reached through the user's own command instead.
-        try { await persist(ctx); }
-        catch (error) {
+        try {
+          await persist(ctx);
+          if (committed) curation.restoreRevisionGap = false;
+        } catch (error) {
           suspendAutomatic(error, "user-command", ctx);
           updateStatus(ctx);
           throw error;
