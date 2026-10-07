@@ -4,6 +4,7 @@ import {
   objectRefKey,
   sha256Value,
   stableStringify,
+  type EvidenceRef,
 } from "./json.ts";
 import {
   contentText,
@@ -77,6 +78,7 @@ import type {
   ProviderMeasurementAnchor,
 } from "./lib/measurement.ts";
 import {
+  assignFoldParents,
   childFoldIds,
   clearPrepared,
   deriveFoldParents,
@@ -86,6 +88,8 @@ import {
   makeFoldRecordEntry,
   makeStateCheckpoint,
   makeStateDelta,
+  parseActiveContextState,
+  validateFoldForest,
   MAX_ACTIVE_FOLD_RECORDS,
   MAX_DELTAS_BETWEEN_CHECKPOINTS,
   materializeStatePersistence,
@@ -136,10 +140,12 @@ import type {
   ActiveContextSnapshot,
   ActiveContextState,
   ActiveContextThresholds,
+  ActiveFold,
   ActiveContextToolAction,
   BriefProvenance,
   FoldCandidate,
   FoldKind,
+  FoldPart,
   FoldRecordEntry,
   PreparedFold,
 } from "./lib/policy.ts";
@@ -445,6 +451,7 @@ export function registerActiveContext(pi: any, options: {
      *  session that never had any, which is what `persistedWireVersion` 0 also means and
      *  which legitimately writes the first checkpoint. See `persist`. */
     lineageUnreadable: false,
+    forkCheckpointPending: false,
     /** Deltas standing after the newest checkpoint in the branch. See
      *  `MAX_DELTAS_BETWEEN_CHECKPOINTS`: at the bound, `persist` writes a checkpoint instead
      *  of a delta, which is what keeps a load's replay bounded. */
@@ -1184,6 +1191,146 @@ export function registerActiveContext(pi: any, options: {
     thresholds,
   }));
 
+  const forkEntriesForSession = (entries: any[], sessionId: string): any[] => {
+    // A child checkpoint supersedes inherited records; keep child records and validate anything newer strictly.
+    const checkpointIndex = entries.findLastIndex((entry) => entry?.type === "custom" &&
+      entry.customType === stateEntryType && ownValue(entry.data, "sessionId") === sessionId &&
+      ownValue(entry.data, "version") === 2 && ownValue(entry.data, "kind") === "checkpoint");
+    if (checkpointIndex < 0) return entries;
+    const inheritedOwners = new Set(entries.slice(0, checkpointIndex).flatMap((entry) => {
+      if (entry?.type !== "custom" || entry.customType !== stateEntryType) return [];
+      const owner = ownValue(entry.data, "sessionId");
+      return typeof owner === "string" && owner !== sessionId ? [owner] : [];
+    }));
+    return entries.filter((entry, index) => {
+      if (entry?.type !== "custom" || entry.customType !== foldRecordEntryType || index >= checkpointIndex) return true;
+      const owner = ownValue(entry.data, "sessionId");
+      return owner === sessionId || typeof owner !== "string" || !inheritedOwners.has(owner);
+    });
+  };
+
+  const forkEntriesForOwner = (entries: any[], sessionId: string): any[] => entries.filter((entry) =>
+    entry?.type !== "custom" || entry.customType !== foldRecordEntryType ||
+    ownValue(entry.data, "sessionId") === sessionId,
+  );
+
+  const rebaseForkState = (
+    state: ActiveContextState,
+    snapshot: ActiveContextSnapshot,
+    sessionId: string,
+  ): ActiveContextState => {
+    const refsByEntryId = new Map<string, ActiveContextSnapshot["branchObjects"]>();
+    for (const item of snapshot.branchObjects) {
+      const refs = refsByEntryId.get(item.ref.entryId) ?? [];
+      refs.push(item);
+      refsByEntryId.set(item.ref.entryId, refs);
+    }
+    const rebaseRef = (ref: ActiveContextState["protected"][number]) => {
+      const matches = refsByEntryId.get(ref.entryId)?.filter((item) =>
+        item.ref.role === ref.role,
+      ) ?? [];
+      if (matches.length !== 1) {
+        throw new Error(`Inherited active-context evidence ${ref.entryId} is missing or ambiguous in the fork branch`);
+      }
+      // Pi's entry identity locates the source; preserve its recorded digest so the
+      // runtime can report content drift instead of silently erasing its provenance.
+      return { ...clone(ref), sessionId };
+    };
+    const rebaseParts = (parts: FoldPart[], resolveFoldId: (id: string) => string): FoldPart[] =>
+      parts.map((part) => {
+        if (part.kind === "raw") return { kind: "raw", ref: rebaseRef(part.ref) };
+        return { kind: "fold", foldId: resolveFoldId(part.foldId) };
+      });
+    const sourceFolds = new Map(state.folds.map((fold) => [fold.id, fold]));
+    const rebasedFolds = new Map<string, { fold: ActiveFold; refs: EvidenceRef[] }>();
+    const visiting = new Set<string>();
+    const rebaseFold = (id: string): { fold: ActiveFold; refs: EvidenceRef[] } => {
+      const existing = rebasedFolds.get(id);
+      if (existing) return existing;
+      const source = sourceFolds.get(id);
+      if (!source) throw new Error(`Inherited active-context fold ${id} is missing`);
+      if (visiting.has(id)) throw new Error(`Inherited active-context fold cycle at ${id}`);
+      visiting.add(id);
+      const parts = rebaseParts(source.parts, (foldId) => rebaseFold(foldId).fold.id);
+      const refs = source.parts.flatMap((part) => {
+        if (part.kind === "raw") return [rebaseRef(part.ref)];
+        return rebaseFold(part.foldId).refs;
+      });
+      const fold: ActiveFold = {
+        ...source,
+        id: foldIdFor(source.kind, parts),
+        parentId: null,
+        parts,
+        sourceSha256: sha256Value(refs),
+      };
+      const rebased = { fold, refs };
+      visiting.delete(id);
+      rebasedFolds.set(id, rebased);
+      return rebased;
+    };
+    const folds = assignFoldParents(state.folds.map((fold) => rebaseFold(fold.id).fold));
+    const rebasedFoldId = (id: string): string => {
+      const rebased = rebasedFolds.get(id);
+      if (!rebased) throw new Error(`Inherited active-context state references missing fold ${id}`);
+      return rebased.fold.id;
+    };
+    let rebased: ActiveContextState;
+    try {
+      const expanded = state.expanded.map(rebasedFoldId);
+      const leases = Object.fromEntries(Object.entries(state.leases).map(([id, value]) => [rebasedFoldId(id), value]));
+      const briefs = Object.fromEntries(Object.entries(state.briefs ?? {}).map(([id, brief]) => [rebasedFoldId(id), brief]));
+      const pendingMarks = (state.pendingMarks ?? []).map((mark) => {
+        if (mark.mark === "refold") return { ...mark, id: rebasedFoldId(mark.id) };
+        const parts = rebaseParts(mark.parts, rebasedFoldId);
+        return { ...mark, id: foldIdFor(mark.kind, parts), parts };
+      });
+      rebased = clearPrepared({
+        ...state,
+        sessionId,
+        folds,
+        expanded,
+        protected: state.protected.map(rebaseRef),
+        leases,
+        ...(state.pendingMarks ? { pendingMarks } : {}),
+        ...(state.briefs ? { briefs } : {}),
+      });
+    } catch (error) {
+      // Keep forest errors ahead of curation errors without validating successful rebases twice.
+      validateFoldForest(folds);
+      throw error;
+    }
+    return parseActiveContextState(rebased, sessionId);
+  };
+
+  const prepareForkRecovery = (
+    ctx: any,
+    branchEntries: any[],
+    sessionId: string,
+    restoredMessages: unknown,
+    restoreError: unknown,
+  ): { inherited: MaterializedStatePersistence; snapshot: ActiveContextSnapshot } => {
+    const inheritedStateEntry = branchEntries.findLast((entry) =>
+      entry?.type === "custom" && entry.customType === stateEntryType,
+    );
+    const inheritedSessionId = ownValue(inheritedStateEntry?.data, "sessionId");
+    if (typeof inheritedSessionId !== "string" || !inheritedSessionId || inheritedSessionId === sessionId) {
+      throw new Error("No distinct inherited session ID is available for fork recovery", { cause: restoreError });
+    }
+    const inherited = materializeStatePersistence(
+      forkEntriesForOwner(branchEntries, inheritedSessionId),
+      inheritedSessionId,
+      stateEntryType,
+      foldRecordEntryType,
+    );
+    if (!Array.isArray(restoredMessages)) {
+      throw new Error("Pi did not provide the fork branch messages needed to rebase active-context state", {
+        cause: restoreError,
+      });
+    }
+    const snapshot = snapshotForEvent(ctx, restoredMessages);
+    return { inherited, snapshot };
+  };
+
   const authoritativeSnapshotFor = (ctx: any): ActiveContextSnapshot => {
     const sessionId = ctx.sessionManager.getSessionId();
     if (!lifecycle.latestSnapshot || lifecycle.latestSnapshot.sessionId !== sessionId) {
@@ -1251,7 +1398,7 @@ export function registerActiveContext(pi: any, options: {
     model: measurement.model,
   });
 
-  const load = (ctx: any, preserveThresholdDecision = false): void => {
+  const load = (ctx: any, preserveThresholdDecision = false, forkedSessionHint = false): void => {
     lifecycle.generation += 1;
     lifecycle.shuttingDown = false;
     cancelPreparation();
@@ -1299,14 +1446,18 @@ export function registerActiveContext(pi: any, options: {
     measurements.providerMeasurementByMessageSha.clear();
     measurements.providerMeasurementAnchorByMessageSha.clear();
     const sessionId = ctx.sessionManager.getSessionId();
+    const forkedSession = forkedSessionHint || Boolean(ctx.sessionManager.getHeader?.()?.parentSession);
     let restored: ActiveContextState | null = null;
     let restoreError: unknown = null;
     let restoredPersistence: MaterializedStatePersistence | null = null;
     let measurementRestoreError: unknown = null;
+    let forkBaseline = false;
+    let startupSnapshot: ActiveContextSnapshot | null = null;
     const branchEntries = [...ctx.sessionManager.getBranch()];
+    const restoredMessages = piContextMessages(ctx);
     try {
       restoredPersistence = materializeStatePersistence(
-        branchEntries,
+        forkedSession ? forkEntriesForSession(branchEntries, sessionId) : branchEntries,
         sessionId,
         stateEntryType,
         foldRecordEntryType,
@@ -1314,10 +1465,28 @@ export function registerActiveContext(pi: any, options: {
       restored = restoredPersistence.state;
     } catch (error) {
       restoreError = error;
+      if (forkedSession) {
+        try {
+          const recovery = prepareForkRecovery(ctx, branchEntries, sessionId, restoredMessages, error);
+          startupSnapshot = recovery.snapshot;
+          restored = rebaseForkState(recovery.inherited.state, startupSnapshot, sessionId);
+          restoredPersistence = recovery.inherited;
+          forkBaseline = true;
+          restoreError = null;
+        } catch (forkError) {
+          restoreError = forkError;
+        }
+      }
     }
     for (const entry of branchEntries) {
       if (entry?.type !== "custom") continue;
       if (entry.customType !== providerMeasurementEntryType) continue;
+      const receiptSessionId = ownValue(entry.data, "sessionId");
+      if (forkedSession && typeof receiptSessionId === "string" && receiptSessionId !== sessionId) {
+        try { parseProviderContextMeasurementReceipt(entry.data, receiptSessionId); }
+        catch (error) { measurementRestoreError = error; }
+        continue;
+      }
       try {
         const receipt = parseProviderContextMeasurementReceipt(entry.data, sessionId);
         const boundRevision = measurements.providerMeasurementRevisionByMessageSha.get(receipt.messageSha256);
@@ -1360,23 +1529,25 @@ export function registerActiveContext(pi: any, options: {
     // the same ids with drifted bytes, 48 of 85 ids left conflicting. The two states are
     // told apart here, once, rather than at each of `persist`'s callers.
     persistence.lineageUnreadable = restoreError !== null;
-    persistence.persistedWireVersion = restoredPersistence?.wireVersion ?? 0;
-    persistence.deltasSinceCheckpoint = restoredPersistence?.deltasSinceCheckpoint ?? 0;
-    persistence.persistedFoldRecords = restoredPersistence?.records ?? new Map<string, FoldRecordEntry>();
-    persistence.persistedStateSha256 = restoredPersistence?.stateSha256 ?? semanticStateSha256(durableRestored);
-    const restoredMessages = piContextMessages(ctx);
+    const persistedRestore = forkBaseline ? null : restoredPersistence;
+    const persistedState = forkBaseline ? emptyActiveContextState(sessionId) : durableRestored;
+    persistence.persistedWireVersion = persistedRestore?.wireVersion ?? 0;
+    persistence.deltasSinceCheckpoint = persistedRestore?.deltasSinceCheckpoint ?? 0;
+    persistence.persistedFoldRecords = persistedRestore?.records ?? new Map<string, FoldRecordEntry>();
+    persistence.persistedStateSha256 = persistedRestore?.stateSha256 ?? semanticStateSha256(persistedState);
+    persistence.persisted = clone(persistedState);
+    persistence.forkCheckpointPending = forkBaseline;
     measurements.lastProviderMeasurement = latestProviderContextMeasurement(
       Array.isArray(restoredMessages) ? restoredMessages : [],
       budgetWindowFor(ctx),
       ctx.model,
     );
     measurements.latestRatio = contextUsageRatio(measurements.lastProviderMeasurement);
-    persistence.persisted = clone(durableRestored);
     // Reuse Pi's own reconstructed messages, including custom messages and branch
     // selection. This is ONLY a view for the bar: do not populate latestSnapshot,
     // advance the frontier, persist a projection, or pretend a provider event occurred.
     if (typeof ctx.ui?.setWidget === "function" && Array.isArray(restoredMessages)) {
-      try { foldBar.startupSnapshot = snapshotForEvent(ctx, restoredMessages); }
+      try { foldBar.startupSnapshot = startupSnapshot ?? snapshotForEvent(ctx, restoredMessages); }
       catch { /* Keep the honest mapping fallback if the host cannot supply a view. */ }
     }
     // The warning names the CONSEQUENCE and not only the cause: "state was ignored" read as
@@ -1424,7 +1595,7 @@ export function registerActiveContext(pi: any, options: {
         next = persistenceProjection(next, projectionSnapshot);
       }
       next.folds = normalizeFoldsForPersistedRecords(next.folds, persistence.persistedFoldRecords);
-      if (sameStateProjection(next, persistence.persisted)) {
+      if (sameStateProjection(next, persistence.persisted) && !persistence.forkCheckpointPending) {
         if (arrivingFoldIds.length) {
           const lost = clone(persistence.state).folds.find((fold) => fold.id === arrivingFoldIds[0]);
           const lostRefs = lost ? flattenFoldRefs(lost, persistence.state) : [];
@@ -1503,6 +1674,7 @@ export function registerActiveContext(pi: any, options: {
       await pi.appendEntry(stateEntryType, wire);
       persistence.persisted = clone(next);
       persistence.persistedWireVersion = 2;
+      persistence.forkCheckpointPending = false;
       persistence.deltasSinceCheckpoint = wire.kind === "checkpoint" ? 0 : persistence.deltasSinceCheckpoint + 1;
       persistence.persistedStateSha256 = wire.stateSha256;
       persistence.state = lifecycle.shuttingDown ? null : clone(next);
@@ -3292,10 +3464,11 @@ export function registerActiveContext(pi: any, options: {
       return [];
     }
   };
-  const enqueueLifecycleLoad = async (ctx: any): Promise<void> => {
+  const enqueueLifecycleLoad = async (ctx: any, forkedSessionHint = false): Promise<void> => {
     const operation = lifecycle.contextQueue.then(() => {
       const loadOperation = ladder.actionQueue.then(async () => {
-        load(ctx);
+        load(ctx, false, forkedSessionHint);
+        if (persistence.forkCheckpointPending) await persist(ctx);
         await recoverNativeReceipts(ctx);
       });
       ladder.actionQueue = loadOperation.catch(() => undefined);
@@ -3305,8 +3478,12 @@ export function registerActiveContext(pi: any, options: {
     await operation;
   };
 
-  const safeLifecycleLoad = async (ctx: any, phase: "session-start" | "session-tree"): Promise<void> => {
-    try { await enqueueLifecycleLoad(ctx); }
+  const safeLifecycleLoad = async (
+    ctx: any,
+    phase: "session-start" | "session-tree",
+    forkedSessionHint = false,
+  ): Promise<void> => {
+    try { await enqueueLifecycleLoad(ctx, forkedSessionHint); }
     catch (error) {
       const sessionId = ctx.sessionManager.getSessionId();
       if (!persistence.state || persistence.state.sessionId !== sessionId) persistence.state = emptyActiveContextState(sessionId);
@@ -3328,12 +3505,14 @@ export function registerActiveContext(pi: any, options: {
     });
   };
 
-  pi.on("session_start", async (_event: unknown, ctx: any) => {
-    await safeLifecycleLoad(ctx, "session-start");
+  pi.on("session_start", async (event: unknown, ctx: any) => {
+    await safeLifecycleLoad(ctx, "session-start", ownValue(event, "reason") === "fork");
     recordResolvedCapacity(ctx);
     await armRollbackLane(ctx);
   });
-  pi.on("session_tree", async (_event: unknown, ctx: any) => { await safeLifecycleLoad(ctx, "session-tree"); });
+  pi.on("session_tree", async (_event: unknown, ctx: any) => {
+    await safeLifecycleLoad(ctx, "session-tree", Boolean(ctx.sessionManager.getHeader?.()?.parentSession));
+  });
   pi.on("session_compact", async (event: Record<string, unknown>, ctx: any) => {
     const reason = boundReceiptText(ownValue(event, "reason"), 64, "unknown");
     const decision = makeNativeDecision(
