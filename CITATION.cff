@@ -6,8 +6,8 @@ type: software
 authors:
   - family-names: Conner
     given-names: Shane
-version: 4.2.6
-date-released: 2026-10-05
+version: 4.2.7
+date-released: 2026-10-07
 license: MIT
 repository-code: "https://github.com/shaneconner/fold"
 url: "https://shaneconner.com/projects/pi-fold/"
